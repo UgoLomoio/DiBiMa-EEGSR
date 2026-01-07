@@ -10,22 +10,26 @@ Code for the reproduction of results obtained in "A Bidirectional Mamba-2 Diffus
 
 To prepare the conda environment, open the terminal and navigate inside the EEGSR directory:
 
-
     conda create -n eegsr python=3.13
     conda activate eegsr
     pip install -r requirements.txt
 
+## Datasets:
+
+- For super-resolution training and evaluation: MMI (autodownload), SEED (manual download needed: https://bcmi.sjtu.edu.cn/home/seed/index.html) 
+- For super-resolution downstream classification: MMI
+- For super-resolution downstream biomedical classification: TO-DO
+
+
 ## 🧪 Ablations
 
-Ablations on Mamba Hyperparameters:
+Ablations on Mamba Presence, Versions, Hyperparameters, and Diffusion DDPM presence:
     
     conda activate eegsr
-    python ablations_mambadim.py
+    python ablations.py
 
-Ablations: DDPM Diffusion & Mamba-2 To assess the impact of DDPM diffusion and Mamba-2 on EEG spatial and temporal super-resolution:
+To assess the impact of DDPM diffusion and Mamba-2 on EEG spatial and temporal super-resolution.
 
-    conda activate eegsr
-    python ablations_diff_mambadim.py
 
 ## 🎯 Training & Validation of the final model: 
     conda activate eegsr
@@ -33,6 +37,8 @@ Ablations: DDPM Diffusion & Mamba-2 To assess the impact of DDPM diffusion and M
     python test.py
 
 ## 📊 Downstream EEG Classification Task Available in downstream_task/ directory.
+
+    TO-DO
 
 ## 📋 To-Do Status
 

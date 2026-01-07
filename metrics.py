@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 from scipy.stats import pearsonr
-from models import DCAE_SR_Diff
+from models import DiBiMa_Diff
 import torch.nn.functional as F
 
 """1D Signal Quality Metrics"""
@@ -165,16 +165,17 @@ def evaluate_model(model, dataloader, n_timesteps=None):
 
     print("Evaluating model performances...")
     with torch.no_grad():
-        for lr_input, hr_target in tqdm(dataloader, desc="Test", unit="seg", leave=False):
+        for lr_input, hr_target, pos in tqdm(dataloader, desc="Test", unit="seg", leave=False):
             lr_input = lr_input.to(device)
             hr_target = hr_target.to(device)
+            pos = pos.to(device)
             #print(lr_input.shape, hr_target.shape)
             
             start = time.time()
             if model.use_diffusion:
                 #print("Using diffusion model for inference...")
-                model_diff = DCAE_SR_Diff(model).to(device)
-                sr_recon = model_diff.sample(lr_input, num_inference_steps=n_timesteps)
+                model_diff = DiBiMa_Diff(model).to(device)
+                sr_recon = model_diff.sample(lr_input, pos, num_inference_steps=n_timesteps)
             else:
                 #print("Using standard model for inference...")
                 sr_recon = model(lr_input)

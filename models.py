@@ -65,18 +65,58 @@ class DecoderBlock(nn.Module):
         x = self.dropout1(self.act(self.deconv1(x)))
         x = self.dropout2(self.act(self.deconv2(x)))
         return x
+    
+class SpatialEmbedding(nn.Module):
+    def __init__(self, reference_position, d_model, hidden_dim=128):
+        super().__init__()
+        if reference_position is not None:
+            self.reference_pos = nn.Parameter(reference_position.float(), requires_grad=False)  # (C_ref, 3)
+        else:
+            self.reference_pos = None
+        self.proj = nn.Sequential(
+            nn.Linear(3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, d_model)
+        )
+    
+    def forward(self, x, positions=None):
+        # Assume proj ends with Linear(..., 64) -> dim=-1=64 unwanted
+        if positions is None:
+            proj_out = self.proj(self.reference_pos)  # (C, out_dim)
+            se = proj_out.mean(-1, keepdim=True).unsqueeze(0)  # (1, C, 1) -> broadcast B
+        else:
+            b, c, _ = positions.shape
+            proj_out = self.proj(positions.view(-1, 3)).view(b, c, -1)  # (B,C,out_dim)
+            se = proj_out.mean(-1, keepdim=True)  # (B, C, 1) — average features per channel
+        return se  # Guaranteed (B,C,1);
+
+
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2) * -(torch.log(torch.tensor(10000.0)) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    
+    def forward(self, x):  # x: (B, seq_len, d_model)
+        return x + self.pe[:, :x.size(1)]
 
 # -------------------------------
-# DCAE_SR_SubPixelRes Model
+# DiBiMa_SubPixelRes Model
 # -------------------------------
 
-class DCAE_SR_nn(nn.Module):
-    def __init__(self, num_channels=64, fs_lr=80, fs_hr=160, seconds=10,
-                 residual_global=True, use_mamba=False, use_diffusion=False,
+class DiBiMa_nn(nn.Module):
+    def __init__(self, target_channels, ref_position=None, num_channels=64, fs_lr=80, fs_hr=160, seconds=10,
+                 residual_global=True, use_mamba=True, use_diffusion=False, use_positional_encoding=False, use_electrode_embedding=False,
                  residual_internal=True, use_subpixel=True, sr_type="temporal", n_mamba_blocks = 1, n_mamba_layers=1, mamba_dim=64, mamba_d_state=16, mamba_version=1):
-        super(DCAE_SR_nn, self).__init__()
+        super(DiBiMa_nn, self).__init__()
 
-        self.target_channels = 64
+        self.target_channels = target_channels
+        self.target_length = fs_hr * seconds
         self.sr_type = sr_type
 
         self.fs_lr = fs_lr
@@ -85,15 +125,38 @@ class DCAE_SR_nn(nn.Module):
         self.hr_len = fs_hr * seconds
         self.lr_len = fs_lr * seconds
 
-        self.use_diffusion = use_diffusion
-        self.time_dim = mamba_dim if use_mamba else 256  # match encoder bottleneck dim
+        self.use_mamba = use_mamba
+        self.n_mamba_layers = n_mamba_layers    
+        self.mamba_dim = mamba_dim
+        self.mamba_d_state = mamba_d_state
+        self.mamba_version = mamba_version
+        self.n_mamba_blocks = n_mamba_blocks
+        self.ref_position = ref_position
 
+        if self.use_mamba:
+            enc_in = int(self.mamba_dim/2)
+            enc_out = self.mamba_dim
+        else:   
+            enc_in = 128
+            enc_out = 256
+
+        self.use_diffusion = use_diffusion
+        self.use_positional_encoding = use_positional_encoding
+        self.use_electrode_embedding = use_electrode_embedding
+        d_model = enc_out
+
+        self.time_dim = enc_out
         if self.use_diffusion:
             self.time_mlp = nn.Sequential(
                 nn.Linear(self.time_dim, self.time_dim),
                 nn.SiLU(),
                 nn.Linear(self.time_dim, self.time_dim),
             )
+            if use_positional_encoding:        
+                self.pos_enc = PositionalEncoding(d_model=d_model)
+
+            if use_electrode_embedding:
+                self.spatial_emb = SpatialEmbedding(self.ref_position, d_model)
 
         if self.sr_type == "spatial":
             if self.use_diffusion:
@@ -102,29 +165,16 @@ class DCAE_SR_nn(nn.Module):
                 self.num_channels = num_channels
             self.input_length = self.hr_len
         else:
-            if self.use_diffusion:
-                self.input_length = self.hr_len + self.lr_len
-            else:
-                self.input_length = self.lr_len
-            self.num_channels = self.target_channels
-   
+            #if self.use_diffusion:
+            self.num_channels = num_channels
+            self.input_length = self.lr_len
+
         self.residual_global = residual_global
         self.residual_internal = residual_internal
         self.use_subpixel = use_subpixel
-        self.use_mamba = use_mamba
         
-        self.n_mamba_layers = n_mamba_layers    
-        self.mamba_dim = mamba_dim
-        self.mamba_d_state = mamba_d_state
-        self.mamba_version = mamba_version
-        self.n_mamba_blocks = n_mamba_blocks
-        
-        # --- Encoder ---
-        if self.use_mamba:
-            enc_in = int(self.mamba_dim/2)
-            self.encoder = nn.Sequential(EncoderBlock([self.num_channels, enc_in], [enc_in, self.mamba_dim], [3, 3], [1, 1], [0.1, 0.1]))
-        else:   
-            self.encoder = nn.Sequential(EncoderBlock([self.num_channels, 128], [128, 256], [3, 3], [1, 1], [0.1, 0.1]))
+        # --- Encoder ---        
+        self.encoder = nn.Sequential(EncoderBlock([self.num_channels, enc_in], [enc_in, enc_out], [3, 3], [1, 1], [0.1, 0.1]))
 
         # --- Bottleneck (residual internal) ---
         if self.residual_internal:
@@ -138,23 +188,22 @@ class DCAE_SR_nn(nn.Module):
             else:
                 print("Using simple bottleneck with residual internal")
                 self.bottleneck = nn.Sequential(
-                    nn.Conv1d(256, 256, kernel_size=1, padding=0),
-                    nn.BatchNorm1d(256),
+                    nn.Conv1d(enc_out, enc_out, kernel_size=1, padding=0),
+                    nn.BatchNorm1d(enc_out),
                     nn.LeakyReLU(inplace=True),
                     nn.Dropout(0.3)
                 )
 
         # --- Decoder ---
         if self.use_subpixel:
-            if not self.use_mamba:
-                conv_d = nn.Conv1d(256, 128, kernel_size=3, padding=1)
+            if self.use_mamba:
+                conv_d = nn.Conv1d(enc_out*2, enc_out, kernel_size=3, padding=1)
+                batch_n = nn.BatchNorm1d(enc_out)
+                sub_pixel_in = enc_out
             else:
-                conv_d = nn.Conv1d(self.mamba_dim*2, self.mamba_dim, kernel_size=3, padding=1)
-            
-            self.decoder_sr = nn.Sequential(
-                conv_d,
-                nn.BatchNorm1d(self.mamba_dim if self.use_mamba else 128),
-            )
+                conv_d = nn.Conv1d(enc_out, enc_out, kernel_size=3, padding=1)
+                batch_n = nn.BatchNorm1d(enc_out)
+                sub_pixel_in = enc_out
 
             if self.sr_type == "spatial":
                 print(f"Using spatial SR: {num_channels} channels to {self.target_channels}")
@@ -163,20 +212,26 @@ class DCAE_SR_nn(nn.Module):
                 print(f"Using temporal SR: {self.lr_len} to {self.hr_len} length")
                 upscale = int(self.hr_len // self.lr_len)
 
+            self.decoder_sr = nn.Sequential(
+                conv_d,
+                batch_n
+            )
+
             self.subpixel = SubPixel1D(
-                in_channels=self.mamba_dim if self.use_mamba else 128,
+                in_channels=sub_pixel_in,
                 out_channels=self.target_channels,
                 upscale_factor=upscale
             )
+
         else:
             if not self.use_mamba:
                 self.decoder_sr = DecoderBlock(
-                    [256, 128], [128, self.target_channels],
+                    [enc_out, enc_in], [enc_in, self.target_channels],
                     [30, 30], [5, 2], [None, None]
                 )
             else:
                 self.decoder_sr = DecoderBlock(
-                    [self.mamba_dim*2, self.mamba_dim], [self.mamba_dim, self.target_channels],
+                    [enc_out*2, enc_out], [enc_out, self.target_channels],
                     [30, 30], [5, 2], [None, None]
                 )
         
@@ -199,8 +254,7 @@ class DCAE_SR_nn(nn.Module):
             emb = F.pad(emb, (0, 1))
         return emb
 
-        
-    def encoder_forward(self, x, t=None, debug=False):
+    def encoder_forward(self, x, pos=None, t=None, debug=False):
         """
         x: [B, C_in, L_in]
         t: [B] or None
@@ -209,41 +263,73 @@ class DCAE_SR_nn(nn.Module):
             print(f"Input shape: {x.shape}")
         x = self.encoder(x)  # [B, 256, L_enc] (or mamba_dim)
 
-        # inject time embedding if diffusion is enabled
         if self.use_diffusion and t is not None:
-            temb = self.timestep_embedding(t, self.time_dim)      # (B, 256)
-            temb = self.time_mlp(temb).unsqueeze(-1)              # (B, 256, 1)
-            x = x + temb                                          # broadcast over length
+            # Time embedding
+            temb = self.timestep_embedding(t, self.time_dim)  # (B, time_dim)
+            temb = self.time_mlp(temb).unsqueeze(-1)  # (B, d_model, 1); broadcast-ready
+            
+            # Spatial embedding (electrode-aware)
+            if self.use_electrode_embedding and pos is not None:
+                se = self.spatial_emb(x, pos)  # (B, d_model, L_enc); or mean(1) if global
+                se = se.mean(dim=-1, keepdim=True)
+            else:
+                print("No electrode positional embedding used.")
+                se = torch.zeros_like(x)  # No spatial embedding
+                
+            # Fuse into feature tensor for conditioning (align dims: repeat temb/se to seq_len)
+            #print(f"x: {x.shape}, temb shape: {temb.shape}, se shape: {se.shape}")
+            
+            feat = x + temb + se  # Broadcast add: (B, d_model, L_enc)
+            
+            if self.use_positional_encoding:
+                feat = feat.transpose(1, 2)  # (B, L_enc, d_model)
+                feat = self.pos_enc(feat)
+                feat = feat.transpose(1, 2)  # Back to (B, d_model, L_enc)
+            
+            condition = feat.mean(2)  # Pool over length: fixed c (B, d_model)
+            if debug: print(f"Condition c shape: {condition.shape}")
+            
+            # Now inject condition back (global add or concat+proj)
+            condition_exp = condition.unsqueeze(-1)  # (B, d_model, 1)
+            x = x + condition_exp  # Or use cross-attn if needed
 
-        residual_premamba = x.clone()
         if self.residual_internal:
+            residual_premamba = x.clone()
             if self.use_mamba:
                 x_mamba = x.transpose(1, 2)
                 x_mamba_out = self.bottleneck(x_mamba, debug=debug)
                 x = x_mamba_out.transpose(1, 2)
             else:
                 x = self.bottleneck(x)
+        else:    
+            residual_premamba = None
 
         return x, residual_premamba
 
-
     def decoder_forward(self, z, residual_premamba, lr=None, t=None, debug=False):
         
-        z = self.decoder_sr(z)
-        z += residual_premamba
+        sr = self.decoder_sr(z)  # (B, C_out, L_out)
 
-        sr = self.subpixel(z) if self.use_subpixel else z
+        if self.residual_internal and residual_premamba is not None:
+            if residual_premamba.shape != sr.shape:
+                raise ValueError(f"Residual shape {residual_premamba.shape} does not match decoder output shape {sr.shape}")
+            sr += residual_premamba
+        
+        if self.use_subpixel:
+            sr = self.subpixel(sr)
+            #if not self.use_mamba:
+            #    print(f"Decoder output shape after subpixel: {sr.shape}")
 
         if self.residual_global is not None and lr is not None:
             if self.sr_type == "spatial":
-                lr_up = unmask_channels(lr, self.target_channels)
+                lr_up = add_zero_channels(lr, self.target_channels)
             else:
-                lr_up = F.interpolate(lr, size=sr.shape[-1], mode='linear', align_corners=False)
-            sr = sr + lr_up
+                lr_up = F.interpolate(lr, size=self.target_length, mode='linear', align_corners=False)
+            sr += lr_up
+            
         return sr
 
     # ---------- regression SR path ----------
-
     def forward_regression(self, lr, hr=None, debug=False):
         """
         lr: low-res input  (B, C_lr, L_lr)
@@ -267,35 +353,39 @@ class DCAE_SR_nn(nn.Module):
         return pred
 
     # ---------- diffusion (DDPM) path ----------
-    def forward_diffusion(self, x_t_hr, t, lr, debug=False):
+    def forward_diffusion(self, x_t_hr, t, lr, pos, debug=False):
         """
-        x_t_hr: noised HR, (B, C_HR, L)
-        lr: clean (or lightly noised) LR EEG, (B, C_LR, L)
-        returns: pred_noise_hr, (B, C_HR, L)
+        x_t_hr: noised HR, (B, C_HR, L_HR)
+        lr: clean (or lightly noised) LR EEG, (B, C_LR, L_LR)
+        returns: pred_noise_hr, (B, C_HR, L_HR)
         """
-        # Example: concat LR as extra channels
-        model_input = torch.cat([x_t_hr, lr], dim=1)  # (B, C_HR + C_LR, L)
+        # x_t_hr: (B, C, L_HR), lr: (B, C, L_LR)
+        if debug:
+            print(f"Diffusion forward shapes - x_t_hr: {x_t_hr.shape}, lr: {lr.shape}, t: {t.shape}, pos: {pos.shape if pos is not None else 'None'}")
+        
+        if self.sr_type == "spatial":
+            model_input = torch.cat([x_t_hr, lr], dim=1)  # (B, C_HR+C_LR, L)
+        else:
+            model_input = lr # (B, C, L_LR)
 
-        # inject t via embeddings inside encoder/decoder
-        z = self.encoder_forward(model_input, t=t, debug=debug)
-        pred_noise_hr = self.decoder_forward(z, t=t, debug=debug)  # (B, C_HR, L)
+        z, residual_premamba = self.encoder_forward(model_input, t=t, pos=pos, debug=debug)
+        pred_noise_hr = self.decoder_forward(z, residual_premamba=residual_premamba, lr = lr, t=t, debug=debug)
         return pred_noise_hr
 
     # ---------- unified forward ----------
-
     def forward(self, *args, **kwargs):
         """
         If use_diffusion = False:
             expect forward(lr, hr=None) -> SR
         If use_diffusion = True:
-            expect forward(x_t_hr, t, cond_lr) -> pred_hr_noise_or_sample
+            expect forward(x_t_hr, t, pos, cond_lr) -> pred_hr_noise_or_sample
         """
         if self.use_diffusion:
             return self.forward_diffusion(*args, **kwargs)
         else:
             return self.forward_regression(*args, **kwargs)
 
-class DCAE_SR(pl.LightningModule):
+class DiBiMa(pl.LightningModule):
 
     def __init__(self, model, learning_rate=0.0001, loss_fn=nn.MSELoss(), debug=False):
 
@@ -318,7 +408,7 @@ class DCAE_SR(pl.LightningModule):
         return loss
     
     def training_step(self, batch, batch_idx):
-        lr_input, hr_target = batch
+        lr_input, hr_target, _ = batch
         sr_recon = self(lr_input)
         loss = self.compute_loss(sr_recon, hr_target)
         self.log('train_loss', loss, prog_bar=True)
@@ -326,7 +416,7 @@ class DCAE_SR(pl.LightningModule):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        lr_input, hr_target = batch
+        lr_input, hr_target, _ = batch
         sr_recon = self(lr_input)
         loss = self.compute_loss(sr_recon, hr_target)
         self.val_losses.append(loss)
@@ -363,7 +453,7 @@ from mamba_ssm import Mamba, Mamba2
 
 class BidirectionalMamba(nn.Module):
 
-    def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, n_layers=2, n_mamba_blocks = 1, mamba_version=1, device = 'cuda:0' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, n_layers=1, n_mamba_blocks = 1, mamba_version=1, device = 'cuda:0' if torch.cuda.is_available() else 'cpu'):
         
         super().__init__()
         
@@ -485,7 +575,7 @@ class BidirectionalMamba(nn.Module):
 from diffusers import DDPMScheduler
 import matplotlib.pyplot as plt
 
-class DCAE_SR_Diff(pl.LightningModule):
+class DiBiMa_Diff(pl.LightningModule):
     def __init__(
         self, 
         model,
@@ -582,7 +672,8 @@ class DCAE_SR_Diff(pl.LightningModule):
         
     def training_step(self, batch, batch_idx):
         
-        lr, hr = batch
+        lr, hr, pos = batch
+        #print(f"Training step batch shapes - LR: {lr.shape}, HR: {hr.shape}, POS: {pos.shape}")
         batch_size = lr.size(0)
                 
         # x0_hr: clean HR EEG, shape (B, C_HR, L)
@@ -592,7 +683,7 @@ class DCAE_SR_Diff(pl.LightningModule):
         x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)  # (B, C_HR, L)
         
         # Model prediction
-        output = self(x_t_hr, t, lr)  # (B, C_HR, L)
+        output = self(x_t_hr, t, lr, pos)  # (B, C_HR, L)
 
         if output.shape != x_t_hr.shape:    
             raise ValueError(f"Model output shape {output.shape} is different than noisy EEG shape {x_t_hr.shape}.")
@@ -610,6 +701,7 @@ class DCAE_SR_Diff(pl.LightningModule):
             loss = self.compute_loss(output, hr)
         
         self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
+        self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
         self.train_losses.append(loss.item())
 
         if self.debug:
@@ -620,7 +712,7 @@ class DCAE_SR_Diff(pl.LightningModule):
         return loss
     
     def validation_step(self, batch, batch_idx):
-        lr, hr = batch
+        lr, hr, pos = batch
         batch_size = lr.size(0)
 
         # Sample timesteps as in training
@@ -637,7 +729,7 @@ class DCAE_SR_Diff(pl.LightningModule):
         x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)
 
         # Model prediction (same signature as training)
-        output = self(x_t_hr, t, lr)  # (B, C_HR, L')
+        output = self(x_t_hr, t, lr, pos)  # (B, C_HR, L')
 
         # Fix length mismatch on time dimension if needed
         if output.shape != x_t_hr.shape:
@@ -656,7 +748,7 @@ class DCAE_SR_Diff(pl.LightningModule):
         else:  # "sample"
             val_loss = self.compute_loss(output, hr)        # HR clean sample
 
-        self.log("val_loss", val_loss, prog_bar=True, on_step=False, on_epoch=True)
+        #self.log("val_loss", val_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.val_losses.append(val_loss.item())
 
         del x_t_hr, output, noise_hr, t, lr, hr
@@ -669,11 +761,11 @@ class DCAE_SR_Diff(pl.LightningModule):
         return super().on_train_epoch_start()
     
     def on_train_epoch_end(self):
-        self.log("train_loss_epoch", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_step=False, on_epoch=True)
+        self.log("avg_train_loss", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_step=False, on_epoch=True)
         return super().on_train_epoch_end()
     
     def on_validation_epoch_end(self):
-        self.log("val_loss_epoch", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_step=False, on_epoch=True)
+        self.log("avg_val_loss", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_step=False, on_epoch=True)
         
         lr = self.lr_to_plot
         hr = self.hr_to_plot
@@ -747,7 +839,7 @@ class DCAE_SR_Diff(pl.LightningModule):
         }
                 
     @torch.no_grad()
-    def sample(self, lr, num_inference_steps=100, return_all_steps=False):
+    def sample(self, lr, pos, num_inference_steps=100, return_all_steps=False):
         
         self.eval()
         device = lr.device
@@ -767,10 +859,9 @@ class DCAE_SR_Diff(pl.LightningModule):
         for t in self.scheduler.timesteps:
             t_batch = torch.full((batch_size,), t, device=device, dtype=torch.long)
             #we concatenate lr as condition inside the model forward, no need to do it here
-            model_output = self(x, t_batch, lr)  # pass t_batch
+            model_output = self(x, t_batch, lr, pos)  # pass t_batch
             step_output = self.scheduler.step(model_output, t, x)
             x = step_output.prev_sample
-
 
             if return_all_steps:
                 samples.append(x.detach().cpu())

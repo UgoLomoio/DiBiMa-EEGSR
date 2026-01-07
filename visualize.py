@@ -5,7 +5,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import torch
 from torch.utils.data import DataLoader
-from models import DCAE_SR_nn
+from models import DiBiMa_nn
 from utils import generate_colors
 import numpy as np
 import plotly.graph_objects as go
@@ -213,7 +213,7 @@ def load_test_data(test_data_path):
 def load_dcae(checkpoint_path, model_class, *model_args, **model_kwargs):
     """
     Loads a DCAE model from various checkpoint formats.
-    model_class: your DCAE class, e.g. DCAE_SR_nn
+    model_class: your DCAE class, e.g. DiBiMa_nn
     *model_args/**model_kwargs: args to construct the model
     """
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -267,7 +267,7 @@ if __name__ == "__main__":
         print("GT shape:", gt.shape)
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        dcae_model_path = cwd + sep + 'model_weights' + sep + 'fold_1' + sep + f'dcae_sr_eeg_with_subpixel_and_both_residuals_{num_ch}to64chs_1.pth'
+        dcae_model_path = cwd + sep + 'model_weights' + sep + 'fold_1' + sep + f'DiBiMa_eeg_with_subpixel_and_both_residuals_{num_ch}to64chs_1.pth'
         model_args = {
             "num_channels": num_ch, 
             "fs_lr": 160, 
@@ -280,7 +280,7 @@ if __name__ == "__main__":
         }
         model_args = tuple(model_args.values())
         
-        dcae = load_dcae(dcae_model_path, DCAE_SR_nn, *model_args)
+        dcae = load_dcae(dcae_model_path, DiBiMa_nn, *model_args)
         dcae.to(device)
 
         print("Running DCAE inference...")
