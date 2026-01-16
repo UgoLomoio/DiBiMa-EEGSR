@@ -5,6 +5,11 @@ import torch.nn.functional as F
 import torch.optim as optim
 import pytorch_lightning as pl
 import os
+from functools import partial
+from mamba_ssm.models.mixer_seq_simple import _init_weights
+from mamba_ssm.ops.triton.layer_norm import RMSNorm
+from mamba_ssm import Mamba, Mamba2
+from mamba_ssm.modules.block import Block
 from utils import unmask_channels, add_zero_channels
  
 project_path = os.path.dirname(os.path.abspath(__file__))
@@ -12,14 +17,14 @@ project_path = os.path.dirname(os.path.abspath(__file__))
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-# -------------------------------
-# Blocco SubPixel 1D
-# -------------------------------
 class SubPixel1D(nn.Module):
-    def __init__(self, in_channels, out_channels, upscale_factor):
+
+    def __init__(self, in_channels, out_channels, upscale_factor, sr_type="temporal"):
+
         super(SubPixel1D, self).__init__()
         self.upscale_factor = upscale_factor
         self.conv = nn.Conv1d(in_channels, out_channels * upscale_factor, kernel_size=3, padding=1)
+        self.sr_type = sr_type
 
     def forward(self, x):
         # x: [B, C, T]
@@ -28,9 +33,11 @@ class SubPixel1D(nn.Module):
         r = self.upscale_factor
         if C % r != 0:
             raise ValueError(f"Channel dimension {C} not divisible by upscale factor {r}")
-        x = x.view(B, C // r, r, T)       # [B, out_channels, r, T]
-        x = x.permute(0, 1, 3, 2)         # [B, out_channels, T, r]
-        x = x.contiguous().view(B, C // r, T * r)  # [B, out_channels, T*r]
+        if self.sr_type == "temporal":
+            # Temporal SR: rearrange time
+            x = x.view(B, C // r, r, T)       # [B, out_channels, r, T]
+            x = x.permute(0, 1, 3, 2)         # [B, out_channels, T, r]
+            x = x.contiguous().view(B, C // r, T * r)  # [B, out_channels, T*r]
         return x
 
 # -------------------------------
@@ -65,32 +72,29 @@ class DecoderBlock(nn.Module):
         x = self.dropout1(self.act(self.deconv1(x)))
         x = self.dropout2(self.act(self.deconv2(x)))
         return x
-    
+
 class SpatialEmbedding(nn.Module):
-    def __init__(self, reference_position, d_model, hidden_dim=128):
+    def __init__(self, reference_position, d_model, hidden_dim=32):
         super().__init__()
+        self.d_model = d_model  
         if reference_position is not None:
-            self.reference_pos = nn.Parameter(reference_position.float(), requires_grad=False)  # (C_ref, 3)
-        else:
-            self.reference_pos = None
-        self.proj = nn.Sequential(
+            self.register_buffer('ref_pos', reference_position.float())  # (C,3)
+        
+        self.pos_proj = nn.Sequential(  # Pos -> channel embeds
             nn.Linear(3, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, d_model)
+            nn.SiLU(),
+            nn.Linear(hidden_dim, d_model)  # Fixed 62->64 adapt
         )
-    
-    def forward(self, x, positions=None):
-        # Assume proj ends with Linear(..., 64) -> dim=-1=64 unwanted
-        if positions is None:
-            proj_out = self.proj(self.reference_pos)  # (C, out_dim)
-            se = proj_out.mean(-1, keepdim=True).unsqueeze(0)  # (1, C, 1) -> broadcast B
+        self.channel_adapt = nn.Linear(d_model, 64)  # Adapt src ch to mamba_dim seq
+
+    def forward(self, positions=None):
+        pos = positions if positions is not None else self.ref_pos.unsqueeze(0)  # (B,C,3)
+        pos_emb = self.pos_proj(pos.reshape(-1,3)).reshape(pos.shape[0], pos.shape[1], -1)  # (B,C,64)
+        if pos_emb.shape[1] != 64:
+            seq_emb = self.channel_adapt(pos_emb.mean(-1))  # (B,C) -> (B,64) via Linear
         else:
-            b, c, _ = positions.shape
-            proj_out = self.proj(positions.view(-1, 3)).view(b, c, -1)  # (B,C,out_dim)
-            se = proj_out.mean(-1, keepdim=True)  # (B, C, 1) — average features per channel
-        return se  # Guaranteed (B,C,1);
-
-
+            seq_emb = pos_emb.mean(-1)  # (B,64)
+        return seq_emb.unsqueeze(-1)  # (B,64,1) — expand to L later
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=5000):
@@ -104,6 +108,78 @@ class PositionalEncoding(nn.Module):
     
     def forward(self, x):  # x: (B, seq_len, d_model)
         return x + self.pe[:, :x.size(1)]
+
+
+class ConvSpatialEmbedding(nn.Module):
+    def __init__(self, reference_position, d_model=64, hidden_dim=32, kernel_size=3):  # d_model=64 for Mamba
+        super().__init__()
+        if reference_position is not None:
+            self.register_buffer('ref_pos', F.normalize(reference_position.float(), dim=-1))  # (62,3) unit sphere
+
+        # CoordConv: Append x,y,z as extra channels
+        self.conv = nn.Sequential(
+            nn.Conv1d(3, hidden_dim, kernel_size, padding="same"),  # in_ch=3
+            nn.SiLU(),
+            nn.Conv1d(hidden_dim, d_model, 1),  # To d_model
+        )
+        self.norm = nn.LayerNorm(d_model)
+
+    def forward(self, positions=None):
+        pos = positions if positions is not None else self.ref_pos.unsqueeze(0)
+        pos_flat = pos.transpose(1,2)  # (B,3,C)
+        conv_out = self.conv(pos_flat)  # Assume (B,64,C)
+        pooled = conv_out.mean(dim=-1)  # Pool electrodes → (B,64)
+        return pooled.unsqueeze(-1)  # (B,64,1) ✓ — now expands to L=1600
+
+class TemporalEmbedding(nn.Module):
+
+    def __init__(self, time_dim):
+        
+        super().__init__()
+        self.time_dim = time_dim
+        self.time_mlp = nn.Sequential(
+            nn.Linear(self.time_dim, self.time_dim),
+            nn.SiLU(),
+            nn.Linear(self.time_dim, self.time_dim),
+        )
+
+    def _timestep_embedding(self, t, dim):
+
+        # t can be scalar () or 1-D (B,)
+        if t.dim() == 0:
+            t = t.unsqueeze(0)          # -> (1,)
+        # now t is (B,)
+
+        device = t.device
+        half_dim = dim // 2
+        emb_factor = math.log(10000) / (half_dim - 1)
+        freqs = torch.exp(torch.arange(half_dim, device=device) * -emb_factor)  # (half_dim,)
+
+        t = t.float()                   # (B,)
+        emb = t[:, None] * freqs[None, :]   # (B, half_dim)
+
+        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)  # (B, dim)
+        if dim % 2 == 1:
+            emb = F.pad(emb, (0, 1))
+        return emb
+
+    def forward(self, t):  # t: (B, d_model, T)
+        
+        temb = self._timestep_embedding(t, self.time_dim)  # [B, time_dim]
+        temb = self.time_mlp(temb).unsqueeze(-1) # (B,64,1)
+        return temb
+
+class SignalEncoder(nn.Module):
+    def __init__(self, in_channels, out_dim, kernel_size=5):
+        super().__init__()
+        self.encoder = nn.Sequential(
+                nn.Conv1d(in_channels, out_dim, kernel_size=kernel_size, padding=kernel_size//2),
+                nn.BatchNorm1d(out_dim),
+                nn.LeakyReLU(),
+                #nn.Dropout(0.3),
+        )
+    def forward(self, x):
+        return self.encoder(x)
 
 # -------------------------------
 # DiBiMa_SubPixelRes Model
@@ -139,24 +215,22 @@ class DiBiMa_nn(nn.Module):
         else:   
             enc_in = 128
             enc_out = 256
-
+            
+        self.time_dim = enc_out
         self.use_diffusion = use_diffusion
         self.use_positional_encoding = use_positional_encoding
         self.use_electrode_embedding = use_electrode_embedding
-        d_model = enc_out
 
-        self.time_dim = enc_out
         if self.use_diffusion:
-            self.time_mlp = nn.Sequential(
-                nn.Linear(self.time_dim, self.time_dim),
-                nn.SiLU(),
-                nn.Linear(self.time_dim, self.time_dim),
-            )
+            
+            self.time_mlp = TemporalEmbedding(self.time_dim)
+
             if use_positional_encoding:        
-                self.pos_enc = PositionalEncoding(d_model=d_model)
+                self.pos_enc = PositionalEncoding(d_model=enc_out)
 
             if use_electrode_embedding:
-                self.spatial_emb = SpatialEmbedding(self.ref_position, d_model)
+                #self.spatial_emb = SpatialEmbedding(self.ref_position, enc_out)
+                self.spatial_emb = ConvSpatialEmbedding(self.ref_position, hidden_dim=self.target_channels, d_model=enc_out)
 
         if self.sr_type == "spatial":
             if self.use_diffusion:
@@ -173,41 +247,42 @@ class DiBiMa_nn(nn.Module):
         self.residual_internal = residual_internal
         self.use_subpixel = use_subpixel
         
-        # --- Encoder ---        
-        self.encoder = nn.Sequential(EncoderBlock([self.num_channels, enc_in], [enc_in, enc_out], [3, 3], [1, 1], [0.1, 0.1]))
+        # --- Encoder ---
+        self.encoder = SignalEncoder(self.num_channels, enc_out, kernel_size=5)
 
         # --- Bottleneck (residual internal) ---
-        if self.residual_internal:
-            if self.use_mamba:
-                print("Using Bi-Mamba bottleneck with residual internal")
-                self.bottleneck = BidirectionalMamba(d_model=self.mamba_dim,
+        if self.use_mamba:
+            print("Using Bi-Mamba bottleneck with residual internal")
+            self.bottleneck = BidirectionalMamba(d_model=self.mamba_dim,
                                                      d_state=self.mamba_d_state,
                                                      n_mamba_blocks=self.n_mamba_blocks,
                                                      n_layers=self.n_mamba_layers,
                                                      mamba_version=self.mamba_version)
-            else:
-                print("Using simple bottleneck with residual internal")
-                self.bottleneck = nn.Sequential(
+        else:
+            print("Using simple bottleneck with residual internal")
+            self.bottleneck = nn.Sequential(
                     nn.Conv1d(enc_out, enc_out, kernel_size=1, padding=0),
                     nn.BatchNorm1d(enc_out),
-                    nn.LeakyReLU(inplace=True),
+                    nn.SiLU(),
                     nn.Dropout(0.3)
-                )
+            )
 
         # --- Decoder ---
         if self.use_subpixel:
+            ks = 3
+            pad = 1
             if self.use_mamba:
-                conv_d = nn.Conv1d(enc_out*2, enc_out, kernel_size=3, padding=1)
+                conv_d = nn.Conv1d(enc_out*2, enc_out, kernel_size=ks, padding=pad)
                 batch_n = nn.BatchNorm1d(enc_out)
                 sub_pixel_in = enc_out
             else:
-                conv_d = nn.Conv1d(enc_out, enc_out, kernel_size=3, padding=1)
+                conv_d = nn.Conv1d(enc_out, enc_out, kernel_size=ks, padding=pad)
                 batch_n = nn.BatchNorm1d(enc_out)
                 sub_pixel_in = enc_out
 
             if self.sr_type == "spatial":
                 print(f"Using spatial SR: {num_channels} channels to {self.target_channels}")
-                upscale = 1  # spatial: channels change, length fixed
+                upscale = 1 #int(self.target_channels // num_channels)  # spatial: channels change, length fixed
             else:
                 print(f"Using temporal SR: {self.lr_len} to {self.hr_len} length")
                 upscale = int(self.hr_len // self.lr_len)
@@ -220,7 +295,8 @@ class DiBiMa_nn(nn.Module):
             self.subpixel = SubPixel1D(
                 in_channels=sub_pixel_in,
                 out_channels=self.target_channels,
-                upscale_factor=upscale
+                upscale_factor=upscale,
+                sr_type=self.sr_type
             )
 
         else:
@@ -234,25 +310,6 @@ class DiBiMa_nn(nn.Module):
                     [enc_out*2, enc_out], [enc_out, self.target_channels],
                     [30, 30], [5, 2], [None, None]
                 )
-        
-    def timestep_embedding(self, t, dim):
-        # t can be scalar () or 1-D (B,)
-        if t.dim() == 0:
-            t = t.unsqueeze(0)          # -> (1,)
-        # now t is (B,)
-
-        device = t.device
-        half_dim = dim // 2
-        emb_factor = math.log(10000) / (half_dim - 1)
-        freqs = torch.exp(torch.arange(half_dim, device=device) * -emb_factor)  # (half_dim,)
-
-        t = t.float()                   # (B,)
-        emb = t[:, None] * freqs[None, :]   # (B, half_dim)
-
-        emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim=1)  # (B, dim)
-        if dim % 2 == 1:
-            emb = F.pad(emb, (0, 1))
-        return emb
 
     def encoder_forward(self, x, pos=None, t=None, debug=False):
         """
@@ -261,48 +318,37 @@ class DiBiMa_nn(nn.Module):
         """
         if debug:
             print(f"Input shape: {x.shape}")
-        x = self.encoder(x)  # [B, 256, L_enc] (or mamba_dim)
 
-        if self.use_diffusion and t is not None:
-            # Time embedding
-            temb = self.timestep_embedding(t, self.time_dim)  # (B, time_dim)
-            temb = self.time_mlp(temb).unsqueeze(-1)  # (B, d_model, 1); broadcast-ready
-            
-            # Spatial embedding (electrode-aware)
-            if self.use_electrode_embedding and pos is not None:
-                se = self.spatial_emb(x, pos)  # (B, d_model, L_enc); or mean(1) if global
-                se = se.mean(dim=-1, keepdim=True)
-            else:
-                print("No electrode positional embedding used.")
-                se = torch.zeros_like(x)  # No spatial embedding
-                
-            # Fuse into feature tensor for conditioning (align dims: repeat temb/se to seq_len)
-            #print(f"x: {x.shape}, temb shape: {temb.shape}, se shape: {se.shape}")
-            
-            feat = x + temb + se  # Broadcast add: (B, d_model, L_enc)
-            
-            if self.use_positional_encoding:
-                feat = feat.transpose(1, 2)  # (B, L_enc, d_model)
-                feat = self.pos_enc(feat)
-                feat = feat.transpose(1, 2)  # Back to (B, d_model, L_enc)
-            
-            condition = feat.mean(2)  # Pool over length: fixed c (B, d_model)
-            if debug: print(f"Condition c shape: {condition.shape}")
-            
-            # Now inject condition back (global add or concat+proj)
-            condition_exp = condition.unsqueeze(-1)  # (B, d_model, 1)
-            x = x + condition_exp  # Or use cross-attn if needed
-
+        x = self.encoder(x)  # [B, C_out, L_enc] (or mamba_dim)
         if self.residual_internal:
             residual_premamba = x.clone()
-            if self.use_mamba:
-                x_mamba = x.transpose(1, 2)
-                x_mamba_out = self.bottleneck(x_mamba, debug=debug)
-                x = x_mamba_out.transpose(1, 2)
-            else:
-                x = self.bottleneck(x)
-        else:    
+        else:
             residual_premamba = None
+            
+        if self.use_diffusion and t is not None:
+            
+            temb = self.time_mlp(t)  # (B,64,1)
+
+            if self.use_electrode_embedding and pos is not None:
+                #print(pos.shape)
+                se = self.spatial_emb(pos)  # (B,64,1)
+                #print(x.shape, temb.shape, se.shape)
+                x = x + se.expand(-1, -1, x.size(-1)) + temb.expand(-1, x.size(1), x.size(-1))  # All (B,64,L)
+            else:
+                x = x + temb.expand(-1, x.size(1), x.size(-1))  # All (B,64,L)
+
+            if self.use_positional_encoding:
+                x = x.transpose(1, 2)  # [B, L_enc, d_model]
+                x = self.pos_enc(x)
+                x = x.transpose(1, 2)  # Back
+                x = x + x.mean(2, keepdim=True)  # Global pool residual (simpler than condition_exp)
+
+        if self.use_mamba:
+            x_mamba = x.transpose(1, 2)
+            x_mamba_out = self.bottleneck(x_mamba, debug=debug)
+            x = x_mamba_out.transpose(1, 2)
+        else:
+            x = self.bottleneck(x)
 
         return x, residual_premamba
 
@@ -325,12 +371,14 @@ class DiBiMa_nn(nn.Module):
                 lr_up = add_zero_channels(lr, self.target_channels)
             else:
                 lr_up = F.interpolate(lr, size=self.target_length, mode='linear', align_corners=False)
-            sr += lr_up
+
+            #print(lr_up.shape, sr.shape)
+            sr += lr_up #+ residual_premamba if residual_premamba is not None else lr_up
             
         return sr
 
     # ---------- regression SR path ----------
-    def forward_regression(self, lr, hr=None, debug=False):
+    def forward_regression(self, lr, hr=None, debug=False, return_latent = False):
         """
         lr: low-res input  (B, C_lr, L_lr)
         hr: high-res target (B, C_hr, L_hr), optional (needed for loss)
@@ -350,10 +398,12 @@ class DiBiMa_nn(nn.Module):
         if debug:
             print(f"Final SR shape: {pred.shape}")
 
+        if return_latent:
+            return pred, z
         return pred
 
     # ---------- diffusion (DDPM) path ----------
-    def forward_diffusion(self, x_t_hr, t, lr, pos, debug=False):
+    def forward_diffusion(self, x_t_hr, t, lr, pos=None, debug=False, return_latent = False):
         """
         x_t_hr: noised HR, (B, C_HR, L_HR)
         lr: clean (or lightly noised) LR EEG, (B, C_LR, L_LR)
@@ -369,8 +419,10 @@ class DiBiMa_nn(nn.Module):
             model_input = lr # (B, C, L_LR)
 
         z, residual_premamba = self.encoder_forward(model_input, t=t, pos=pos, debug=debug)
-        pred_noise_hr = self.decoder_forward(z, residual_premamba=residual_premamba, lr = lr, t=t, debug=debug)
-        return pred_noise_hr
+        pred = self.decoder_forward(z, residual_premamba=residual_premamba, lr = lr, t=t, debug=debug)
+        if return_latent:
+            return pred, z
+        return pred
 
     # ---------- unified forward ----------
     def forward(self, *args, **kwargs):
@@ -387,7 +439,7 @@ class DiBiMa_nn(nn.Module):
 
 class DiBiMa(pl.LightningModule):
 
-    def __init__(self, model, learning_rate=0.0001, loss_fn=nn.MSELoss(), debug=False):
+    def __init__(self, model, learning_rate=0.0001, loss_fn=nn.MSELoss(), debug=False, plot=False):
 
         super().__init__()
         self.model = model
@@ -396,6 +448,19 @@ class DiBiMa(pl.LightningModule):
         self.train_losses = []
         self.val_losses = []
         self.debug = debug
+        self.plot = plot
+
+        self.lr_to_plot = None
+        self.hr_to_plot = None
+        self.pred_to_plot = None
+
+        if self.plot:
+            #input vs output vs condition
+            self.fig_inout = plt.figure(figsize=(12, 6))
+            self.ax_inout = self.fig_inout.add_subplot(1, 1, 1)
+            self.ax_inout.set_title("GeneratedHR - TargetHR - LRCondition")
+            self.ax_inout.set_xlabel("Time")
+            self.ax_inout.set_ylabel("Amplitude")
 
     def forward(self, x):
         return self.model(x, debug=self.debug)
@@ -408,24 +473,32 @@ class DiBiMa(pl.LightningModule):
         return loss
     
     def training_step(self, batch, batch_idx):
-        lr_input, hr_target, _ = batch
+        lr_input, hr_target, _, _ = batch
         sr_recon = self(lr_input)
         loss = self.compute_loss(sr_recon, hr_target)
-        self.log('train_loss', loss, prog_bar=True)
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log('train_loss', loss, prog_bar=True)
         self.train_losses.append(loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        lr_input, hr_target, _ = batch
+        lr_input, hr_target, _, _ = batch
         sr_recon = self(lr_input)
+        if self.plot and batch_idx == 0:
+            self.lr_to_plot = lr_input[0].cpu().numpy()
+            self.hr_to_plot = hr_target[0].cpu().numpy()
+            self.pred_to_plot = sr_recon[0].cpu().numpy()
         loss = self.compute_loss(sr_recon, hr_target)
         self.val_losses.append(loss)
         return loss
         
     def on_train_epoch_end(self):
         avg_loss = torch.stack(self.train_losses).mean()
-        self.log('avg_train_loss', avg_loss, prog_bar=True, on_epoch=True)
-        self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log('avg_train_loss', avg_loss, prog_bar=True, on_epoch=True)
+            self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
         return super().on_train_epoch_end()
     
     def on_train_epoch_start(self):
@@ -435,7 +508,16 @@ class DiBiMa(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         avg_loss = torch.stack(self.val_losses).mean()
-        self.log('avg_val_loss', avg_loss, prog_bar=True, on_epoch=True)
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log('avg_val_loss', avg_loss, prog_bar=True, on_epoch=True)
+            if self.plot and self.lr_to_plot is not None and self.hr_to_plot is not None and self.pred_to_plot is not None:
+                self.ax_inout.clear()
+                self.ax_inout.plot(self.lr_to_plot.mean(dim=0), label="LRCondition")
+                self.ax_inout.plot(self.hr_to_plot.mean(dim=0), label="TargetHR")
+                self.ax_inout.plot(self.pred_to_plot.mean(dim=0), label="GeneratedHR")
+                self.ax_inout.legend()
+                self.fig_inout.canvas.draw()
         return super().on_validation_epoch_end()
 
     def on_validation_epoch_start(self):
@@ -449,8 +531,6 @@ class DiBiMa(pl.LightningModule):
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.5)
         return {'optimizer': optimizer, 'lr_scheduler': scheduler, 'monitor': 'avg_train_loss'}
 
-from mamba_ssm import Mamba, Mamba2
-
 class BidirectionalMamba(nn.Module):
 
     def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, n_layers=1, n_mamba_blocks = 1, mamba_version=1, device = 'cuda:0' if torch.cuda.is_available() else 'cpu'):
@@ -461,95 +541,65 @@ class BidirectionalMamba(nn.Module):
         self.n_layers = n_layers
         self.n_mamba_blocks = n_mamba_blocks
 
-        self.forward_layers = []
-        self.backward_layers = []
+        self.forward_layers = nn.ModuleList([])
+        self.backward_layers = nn.ModuleList([])
         self.device = device
 
-        for _ in range(n_layers):
+        for i in range(n_layers):
+
             if mamba_version == 1:
-                self.forward_layers.append(
-                    nn.ModuleList([
-                        Mamba(
-                            d_model=d_model,
-                            d_state=d_state,
-                            d_conv=d_conv,
-                            expand=expand
-                        ).to(self.device) for _ in range(self.n_mamba_blocks)
-                    ])
-                )
-                self.backward_layers.append(
-                    nn.ModuleList([
-                        Mamba(
-                            d_model=d_model,
-                            d_state=d_state,
-                            d_conv=d_conv,
-                            expand=expand
-                        ).to(self.device) for _ in range(self.n_mamba_blocks)
-                    ])
+                mamba_instance = Mamba
+            else:
+                mamba_instance = Mamba2
+
+            fwd_blocks = nn.ModuleList([])
+            bwd_blocks = nn.ModuleList([])
+            for j in range(n_mamba_blocks):
+                fwd_blocks.append(
+                        Block(
+                            d_model,
+                            mixer_cls = partial(mamba_instance, layer_idx = j, d_state=d_state, d_conv=d_conv, expand=expand),
+                            mlp_cls=partial(nn.Linear, d_model, d_model),
+                            norm_cls = partial(RMSNorm, eps=1e-5),
+                            fused_add_norm = False
+                        ).to(self.device)
+                    )
+                
+                bwd_blocks.append(
+                    Block(
+                        d_model,
+                        mixer_cls = partial(mamba_instance, layer_idx = j, d_state=d_state, d_conv=d_conv, expand=expand),
+                        mlp_cls=partial(nn.Linear, d_model, d_model),
+                        norm_cls = partial(RMSNorm, eps=1e-5),
+                        fused_add_norm = False
+                    ).to(self.device)
                 )
 
-            elif mamba_version == 2:
-                self.forward_layers.append(
-                    nn.ModuleList([ 
-                        Mamba2(
-                            d_model=d_model,
-                            d_state=d_state,
-                            d_conv=d_conv,
-                            expand=expand
-                        ).to(self.device) for _ in range(self.n_mamba_blocks)
-                    ])
-                )
-                self.backward_layers.append(
-                    nn.ModuleList([
-                        Mamba2(
-                            d_model=d_model,
-                            d_state=d_state,
-                            d_conv=d_conv,
-                            expand=expand
-                        ).to(self.device) for _ in range(self.n_mamba_blocks)
-                    ])
-                )
-            elif mamba_version == 3:
-                raise NotImplementedError("Mamba version 3 is not implemented yet.")
+            self.apply(partial(_init_weights, n_layer=i))
+
+            self.forward_layers.append(fwd_blocks)
+            self.backward_layers.append(bwd_blocks)
             
-        self.norm1_layers = []
-        self.norm2_layers = []
-
-        for _ in range(n_layers):
-
-            self.norm1_layers.append(nn.RMSNorm(d_model).to(self.device))
-            self.norm2_layers.append(nn.RMSNorm(d_model).to(self.device))
-
-        self.norm1_layers = nn.ModuleList(self.norm1_layers)
-        self.norm2_layers = nn.ModuleList(self.norm2_layers)
-        self.forward_layers = nn.ModuleList(self.forward_layers)
-        self.backward_layers = nn.ModuleList(self.backward_layers)
-
-
-    def _bimamba_layer(self, x, fwd_layer, bwd_layer, norm1, norm2, debug=False):
-        
-        residual = x.clone()
-        x_norm = norm1(x)  # Shared pre-norm
+    def _bimamba_layer(self, x, fwd_blocks, bwd_blocks, debug=False):
         
         # === FORWARD PASS ===
-        mamba_out_forward = x_norm
-        for i, layer in enumerate(fwd_layer):
-            mamba_out_forward = layer(mamba_out_forward) + x_norm  # FIXED: original x_norm
-            if debug: print(f"Fwd {i}: {mamba_out_forward.shape}")
+        for_residual = None
+        forward_f = x.clone()
+        for block in fwd_blocks:
+            forward_f, for_residual = block(forward_f, for_residual, inference_params=None)
+        residual = (forward_f + for_residual) if for_residual is not None else forward_f
+
+        if bwd_blocks is not None:
+            back_residual = None
+            backward_f = torch.flip(x, [1])
+            for block in bwd_blocks:
+                backward_f, back_residual = block(backward_f, back_residual, inference_params=None)
+            back_residual = (backward_f + back_residual) if back_residual is not None else backward_f
+
+            back_residual = torch.flip(back_residual, [1])
+            residual = torch.cat([residual, back_residual], -1)
         
-        # === BACKWARD PASS ===
-        bw_input = torch.flip(x_norm, dims=[1])  # Flip shared norm
-        backward_residual = bw_input.clone()
-        mamba_out_backward = bw_input
-        for i, layer in enumerate(bwd_layer):
-            mamba_out_backward = layer(mamba_out_backward) + backward_residual  # FIXED: original backward_residual
-            if debug: print(f"Bwd {i}: {mamba_out_backward.shape}")
-        mamba_out_backward = torch.flip(mamba_out_backward, dims=[1])  # Unflip
-        
-        # === COMBINE ===
-        combined = norm2(mamba_out_forward + mamba_out_backward)
-        out = torch.cat([combined, residual], dim=-1) #out = combined + residual
-        return out
+        return residual
 
     def forward(self, x, debug=False):  # [B, L, D]
         
@@ -560,8 +610,6 @@ class BidirectionalMamba(nn.Module):
                 x,
                 self.forward_layers[i],
                 self.backward_layers[i],
-                self.norm1_layers[i],
-                self.norm2_layers[i],
                 debug=debug
             )
             #x = x + residual_inner
@@ -569,9 +617,9 @@ class BidirectionalMamba(nn.Module):
                 print(f"After Bi-Mamba layer {i}: {x.shape}")
         #x = x + residual
         return x    
-        
 
-    
+
+
 from diffusers import DDPMScheduler
 import matplotlib.pyplot as plt
 
@@ -581,6 +629,7 @@ class DiBiMa_Diff(pl.LightningModule):
         model,
         criterion = nn.MSELoss(),
         diffusion_params=None,
+        epochs = 0,
         learning_rate=1e-4,
         scheduler_params=None,
         predict_type="epsilon",  # "epsilon" or "sample"
@@ -595,7 +644,8 @@ class DiBiMa_Diff(pl.LightningModule):
         self.model = model
         self.model.use_diffusion = use_diffusion
         self.use_diffusion = use_diffusion
-        
+        self.epochs = epochs
+
         # Criterion
         self.criterion = criterion
 
@@ -627,6 +677,7 @@ class DiBiMa_Diff(pl.LightningModule):
         self.lr_to_plot = None
         self.noisy_lr_to_plot = None
         self.hr_to_plot = None
+        self.pred_to_plot = None
 
         #print(f"Initialized with prediction type: {self.predict_type}")
         #print(f"Scheduler prediction type: {scheduler_prediction_type}")
@@ -634,7 +685,7 @@ class DiBiMa_Diff(pl.LightningModule):
         self.debug = debug
         self.plot = plot
 
-        if self.debug or self.plot:
+        if self.plot:
  
             #input vs output vs condition
             self.fig_inout = plt.figure(figsize=(12, 6))
@@ -642,22 +693,14 @@ class DiBiMa_Diff(pl.LightningModule):
             self.ax_inout.set_title("GeneratedHR - TargetHR - LRCondition")
             self.ax_inout.set_xlabel("Time")
             self.ax_inout.set_ylabel("Amplitude")
-            
-            #patches visualization
-            """
-            self.fig_patches = plt.figure(figsize=(12, 6))
-            self.ax_patches = self.fig_patches.add_subplot(1, 1, 1)
-            self.ax_patches.set_title("Patches Visualization")
-            self.ax_patches.set_xlabel("Patch Index")
-            self.ax_patches.set_ylabel("Patch Value")
-            """
-            
+
+                    
     def forward(self, *args, **kwargs):
         """
         If self.model.use_diffusion == False:
             expect forward(lr) -> SR 
         If self.model.use_diffusion == True:
-            expect forward(x_t_hr, t, lr) -> pred (noise or sample)
+            expect forward(x_t_hr, t, lr, pos=None) -> pred (noise or sample) but outputs always SR sample 
         """
         if self.model.use_diffusion:
             return self.model.forward_diffusion(*args, debug=self.debug, **kwargs)
@@ -672,14 +715,13 @@ class DiBiMa_Diff(pl.LightningModule):
         
     def training_step(self, batch, batch_idx):
         
-        lr, hr, pos = batch
-        #print(f"Training step batch shapes - LR: {lr.shape}, HR: {hr.shape}, POS: {pos.shape}")
+        lr, hr, pos, label = batch
+        #print("Training step batch shapes - LR: {}, HR: {}, POS: {}".format(lr.shape, hr.shape, pos.shape))
         batch_size = lr.size(0)
                 
         # x0_hr: clean HR EEG, shape (B, C_HR, L)
         noise_hr = torch.randn_like(hr)
-        t = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,), device=hr.device, dtype=torch.long)
-
+        t = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,), device=hr.device, dtype=torch.long) # (B,)
         x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)  # (B, C_HR, L)
         
         # Model prediction
@@ -689,30 +731,26 @@ class DiBiMa_Diff(pl.LightningModule):
             raise ValueError(f"Model output shape {output.shape} is different than noisy EEG shape {x_t_hr.shape}.")
         
         # Compute loss based on prediction type
-        if self.predict_type == "epsilon":
+        if self.predict_type in ["epsilon", "v_prediction"]:
             # Predict epsilon (noise)
-            #print("Computing loss on predicted noise")
-            #print(f"Output shape: {output.shape}, Noise shape: {noise.shape}")
             loss = self.compute_loss(output, noise_hr)
         else:
-            #print("Computing loss on predicted clean sample")
-            #print(f"Output shape: {output.shape}, HR shape: {hr.shape}")
             # Predict x0 (clean sample)
             loss = self.compute_loss(output, hr)
-        
-        self.log("train_loss", loss, prog_bar=True, on_step=True, on_epoch=True)
-        self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
+
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log("train_loss", loss, prog_bar=True)
         self.train_losses.append(loss.item())
 
         if self.debug:
             raise Exception("Debug mode - stopping after one training step")
 
-        del output, noise_hr, t, lr, hr  # Free up memory
-        
         return loss
     
     def validation_step(self, batch, batch_idx):
-        lr, hr, pos = batch
+        
+        lr, hr, pos, label = batch
         batch_size = lr.size(0)
 
         # Sample timesteps as in training
@@ -735,23 +773,22 @@ class DiBiMa_Diff(pl.LightningModule):
         if output.shape != x_t_hr.shape:
             raise ValueError(f"Model output length {output.shape} is shorter than noisy HR length {x_t_hr.shape}.")
 
-        # Store for plotting (use something consistent)
-        if batch_idx == 0 and (self.debug or self.plot):
-            self.noisy_hr_to_plot = x_t_hr[0].detach().cpu()
-            self.lr_to_plot = lr[0].detach().cpu()
-            self.hr_to_plot = hr[0].detach().cpu()
-            self.pred_to_plot = output[0].detach().cpu()
-
         # Compute loss based on prediction type
-        if self.predict_type == "epsilon":
+        if self.predict_type in ["epsilon", "v_prediction"]:
             val_loss = self.compute_loss(output, noise_hr)  # HR noise
         else:  # "sample"
             val_loss = self.compute_loss(output, hr)        # HR clean sample
-
-        #self.log("val_loss", val_loss, prog_bar=True, on_step=False, on_epoch=True)
         self.val_losses.append(val_loss.item())
+        
+        self.lr_to_plot = lr[0].detach().cpu()
+        self.hr_to_plot = hr[0].detach().cpu()
+        
+        if self.predict_type in ["epsilon", "v_prediction"]:
+            # Reconstruct sample from predicted noise
+            output = output - noise_hr
 
-        del x_t_hr, output, noise_hr, t, lr, hr
+        self.pred_to_plot = output[0].detach().cpu()
+
         return val_loss
 
 
@@ -761,20 +798,28 @@ class DiBiMa_Diff(pl.LightningModule):
         return super().on_train_epoch_start()
     
     def on_train_epoch_end(self):
-        self.log("avg_train_loss", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_step=False, on_epoch=True)
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log("avg_train_loss", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_epoch=True)
+            sch = self.lr_schedulers()
+            if sch:
+                self.log("lr", sch.get_last_lr()[0], prog_bar=True)
         return super().on_train_epoch_end()
     
     def on_validation_epoch_end(self):
-        self.log("avg_val_loss", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_step=False, on_epoch=True)
+        
+        torch.no_grad_context_manager = torch.no_grad()
+        with torch.no_grad():
+            self.log("avg_val_loss", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_epoch=True)
         
         lr = self.lr_to_plot
         hr = self.hr_to_plot
-        noisy_lr = self.noisy_lr_to_plot
+        output = self.pred_to_plot
 
         if not self.plot:
             return super().on_validation_epoch_end()
         else:
-            if lr is None or hr is None or noisy_lr is None:
+            if lr is None or hr is None or output is None:
                 print("No signals stored for plotting.")
             else:
                 #print("Debugging mode - plotting results for the first sample in the batch")
@@ -783,15 +828,28 @@ class DiBiMa_Diff(pl.LightningModule):
                 self.ax_inout.clear()
                 
                 # Plot signals with proper labels
-                if self.lr_to_plot is not None:
-                    self.ax_inout.plot(self.lr_to_plot.detach().cpu().numpy(), 
-                                    label="LR Condition", color='green', alpha=0.5, linewidth=1)
+                if self.model.sr_type == "spatial":
+                    lr_up = add_zero_channels(lr, hr.shape[0])
+                else:
+                    lr_up = F.interpolate(lr.unsqueeze(0), size=hr.shape[1], mode='linear', align_corners=False).squeeze(0)
+
+                for ch in range(hr.shape[0]):
+                    if torch.all(lr_up[ch] == 0):  # Exact all-zero [fast, GPU-safe]
+                        # Skip or mask channel
+                        break
                 
-                self.ax_inout.plot(self.noisy_lr_to_plot.detach().cpu().numpy(), 
-                                label="Generated HR", color='blue', alpha=0.5, linewidth=1)
-                
-                self.ax_inout.plot(self.hr_to_plot.detach().cpu().numpy(), 
-                                label="Target HR", color='red', alpha=0.5, linewidth=0.5)
+                lr_up_ch = lr_up[ch]
+                hr_ch = hr[ch]
+                output_ch = output[ch]
+
+                lr_up_ch = lr_up.mean(dim=0)
+                hr_ch = hr.mean(dim=0)
+                output_ch = output.mean(dim=0)
+
+                self.ax_inout.plot(hr_ch.detach().cpu().numpy(), label="Target HR", color='green', alpha=1, linewidth=1)                
+                self.ax_inout.plot(output_ch.detach().cpu().numpy(), label="Generated HR", color='purple', alpha=1, linewidth=0.8)
+                if lr_up is not None:
+                    self.ax_inout.plot(lr_up_ch.detach().cpu().numpy(), label="LR Condition", color='red', alpha=1, linewidth=0.5, linestyle='dashed')
                 
                 self.ax_inout.set_xlabel('Time Steps')
                 self.ax_inout.set_ylabel('Amplitude')
@@ -820,21 +878,20 @@ class DiBiMa_Diff(pl.LightningModule):
             betas=(0.9, 0.999)
         )
         
-        if not self.scheduler_params:
-            return optimizer
-        
+        #lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3, threshold=1e-3)
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.scheduler_params.get('T_max', 100),
-            eta_min=self.scheduler_params.get('eta_min', 1e-6)
+            T_max=self.epochs,
+            eta_min=1e-3
         )
-        
+
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
-                'scheduler': lr_scheduler,
-                'interval': 'epoch',
-                'frequency': 1
+                        'scheduler': lr_scheduler,
+                        'monitor': 'avg_val_loss', 
+                        'interval': 'epoch',
+                        'frequency': 1
             }
         }
                 

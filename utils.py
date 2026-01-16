@@ -1,8 +1,8 @@
 
-from curses import raw
+from operator import __getitem__
 import os
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 import torch
 from torch.utils.data import Dataset
 import mne
@@ -12,8 +12,11 @@ import shutil
 import matplotlib.pyplot as plt
 from umap import UMAP
 import random
+import gc
 
-seed = 42
+import torch
+# Set random seeds for reproducibility
+seed = 2
 np.random.seed(seed)
 torch.manual_seed(seed)
 
@@ -27,8 +30,8 @@ unmask_channels = {
 }
 
 map_runs_dataset = {
-    "mmi": range(3, 4),
-    "seed": None  # Use all available runs for SEED
+    "mmi": range(1, 15),
+    "seed": None  # All files in folder
 }
 
 map_runs_mmi = {
@@ -88,19 +91,15 @@ def get_electrode_positions(raw, channel_order=None):
     locs = torch.tensor(locs, dtype=torch.float32)  # (C_eeg, 3)
     return locs
 
-def download_split_mmi_data(subject_ids, runs, project_path, fs_hr=160, fs_lr=20, seconds=10, verbose=False):
+def download_mmi_data(subject_ids, runs, project_path, demo = False, verbose=False):
 
-    raw_datas = []
-    datas_lr = []
-    datas_hr = []
+    datas = []
     labels = []
     positions = []
-    lr_window_length = fs_lr * seconds  # 10 seconds
-    hr_window_length = fs_hr * seconds  # 10 seconds
-    sr_factor = int(fs_hr // fs_lr)
 
-    for subject in subject_ids:
+    for i, subject in enumerate(subject_ids):
         #print(f"Processing subject {subject}")
+        print(f"⬇️  Downloading/Reading data for subject: {i+1}/{len(subject_ids)}", end='\r')
         for run in runs:
             local_path = os.path.join(project_path, f'S{subject:03d}R{run:02d}.edf')
             #print(f"Checking local path: {local_path}")
@@ -125,43 +124,23 @@ def download_split_mmi_data(subject_ids, runs, project_path, fs_hr=160, fs_lr=20
                 montage = mne.channels.make_standard_montage('standard_1020')
                 raw.set_montage(montage, on_missing='ignore', match_case=False)  # Ignore extras, case-insensitive[web:87]
 
-                raw_datas.append(raw)
                 raw = _preprocess_raw(raw, verbose=verbose)
                 data = raw.get_data()
-                sfreq = raw.info['sfreq']
-
-                # ================================
-                # 🔹 HR (160 Hz)
-                # ================================
-                if fs_hr == sfreq:
-                    data_hr = data
-
-                # ================================
-                # 🔹 LR (20 Hz)
-                # ================================
-                if fs_lr == fs_hr:
-                    data_lr = data_hr
-                else:
-                    #print(f"Resampling from {sfreq} Hz to {fs_lr} Hz for LR data...")
-                    sfreq_lr = fs_lr  # 16 Hz
-                    num_samples_lr = int(data_hr.shape[1] * (sfreq_lr / fs_hr))
-                    data_lr = signal.resample(data_hr, num_samples_lr, axis=1)
-                    
-                # ================================
-                # 🔹 Segmentation
-                # ================================
-                for start in range(0, data_lr.shape[1] - lr_window_length, lr_window_length):
-                    lr_seg = data_lr[:, start:start + lr_window_length]
-                    hr_seg = data_hr[:, (start*sr_factor):(start * sr_factor + hr_window_length)]
-                    
-                    datas_lr.append(lr_seg.astype(np.float32))
-                    datas_hr.append(hr_seg.astype(np.float32))
-                    labels.append(run)  # Example label: run number
-                    positions.append(get_electrode_positions(raw))
-
+                data = data*1e6  # scale to microvolts
+                data = data.astype(np.float32)
+                datas.append(data)
+                label = run#map_runs_mmi[run]
+                labels.append(label)
+                position = get_electrode_positions(raw, channel_order=None)
+                positions.append(position)
+            
             except Exception as e:
                 print(f"⚠️ Exception during processing {local_path}: {e}")
                 continue
+        
+        if demo:
+            if i == 1:
+               break  # For demo
 
     # Clean up downloaded files
     path_to_remove = os.path.join(
@@ -171,20 +150,90 @@ def download_split_mmi_data(subject_ids, runs, project_path, fs_hr=160, fs_lr=20
     if os.path.exists(path_to_remove):
         shutil.rmtree(path_to_remove)
 
-    datas_lr = np.array(datas_lr, dtype=np.float32)
-    datas_hr = np.array(datas_hr, dtype=np.float32)
-    
-    datas_lr = datas_lr*1e6  # scale to microvolts 
-    datas_hr = datas_hr*1e6  # scale to microvolts
+    labels = np.array(labels, dtype=np.int32)
+    labels = torch.tensor(labels)
+    positions = np.array(positions)
+    positions = torch.tensor(positions, dtype=torch.float32)
+    return datas, labels, positions
 
-    #print(len(datas_lr), "LR segments shape:", datas_lr.shape)
-    #print(len(datas_hr), "HR segments shape:", datas_hr.shape)
-    #print(len(raw_datas), "raw data files processed.")
-    #print(len(labels), "total segments with labels.")
-    #print(len(positions), "total electrode position sets.")
-    return datas_lr, datas_hr, raw_datas, labels, positions
+def load_mat(filepath):
+    import scipy.io
+    mat = scipy.io.loadmat(filepath)
+    return mat
 
-def download_eegbci_data(subject_ids, runs, project_path, dataset_name="mmi", fs_hr=160, fs_lr=20, seconds=10, verbose=False):
+def load_seed_channel_positions(filepath):
+    channels = []
+    positions = []
+    with open(filepath, 'r') as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) >= 4:
+                ch_name = parts[0]  # Or parts[-1] if label last
+                theta_deg = float(parts[1])  # Azimuth, negative=left
+                phi_frac = float(parts[2])   # Elevation fraction (~0-0.6)
+                phi_rad = np.radians(phi_frac * 90)  # Adjust scale to ~90° max
+                theta_rad = np.radians(theta_deg)
+                x = np.sin(phi_rad) * np.cos(theta_rad)
+                y = np.sin(phi_rad) * np.sin(theta_rad)
+                z = np.cos(phi_rad)
+                channels.append(ch_name)
+                positions.append([x, y, z])
+    return channels, np.array(positions)
+
+def load_seed_data(subject_ids, project_path, demo=False, verbose=False):
+
+    seed_datapath = os.path.join(project_path, "Preprocessed_EEG")
+    files = os.listdir(seed_datapath)
+    if len(files) == 0:
+        raise ValueError("No SEED data found in the specified path.")
+
+    datas = []
+    labels = []
+    positions = []
+
+    channels, position = load_seed_channel_positions(os.path.join(project_path, "channel_62_pos.locs"))
+    i = 0
+    for file in files:
+        for subject in subject_ids:
+            print(f"Processing subject {i+1}/{len(subject_ids)}", end='\r')
+            if file.startswith(f'{int(subject)}_'):
+                filepath = os.path.join(seed_datapath, file)
+                try:
+                    data_hr = load_mat(filepath)
+                    sfreq = 200  # Original SEED sampling rate
+                    eeg_keys = [key for key in data_hr.keys() if "eeg" in key.lower()]
+                    if len(eeg_keys) == 0:
+                        print(f"No EEG data found in {filepath}.")
+                        continue
+                    else:
+                        for key in eeg_keys:
+                            
+                            data = data_hr[key]  # Shape: (channels, samples)
+                            raw = mne.io.RawArray(data, mne.create_info(ch_names=channels, sfreq=sfreq, ch_types='eeg'))
+                            raw = _preprocess_raw(raw, verbose=verbose)
+
+                            data = raw.get_data()
+                            data = data*1e6  # scale to microvolts
+                            data = data.astype(np.float32)
+                            datas.append(data)
+                            labels.append(int(subject))
+                            positions.append(torch.tensor(position, dtype=torch.float32))
+
+                    i += 1
+                    break  # Move to next file after processing current subject
+                except Exception as e:
+                    print(f"⚠️ Exception during processing {filepath}: {e}")
+            if demo:
+                if i == 1:
+                    break  # For demo, process only first subject
+
+    positions = np.array(positions)
+    positions = torch.tensor(positions, dtype=torch.float32)
+    labels = np.array(labels, dtype=np.int32)
+    labels = torch.tensor(labels)
+    return datas, labels, positions
+
+def download_eegbci_data(subject_ids, runs, project_path, demo=False, dataset_name="mmi", verbose=False):
     """
     Scarica i dati EEG BCI per i soggetti e le sessioni specificate.
     Salva i file EDF localmente in project_path.
@@ -193,9 +242,19 @@ def download_eegbci_data(subject_ids, runs, project_path, dataset_name="mmi", fs
         raise ValueError("Dataset not supported. Use 'mmi' or 'seed'.")
     
     if dataset_name.lower() == "mmi":
-        return download_split_mmi_data(subject_ids, runs, project_path, fs_hr, fs_lr, seconds, verbose)
+        return download_mmi_data(subject_ids, runs, project_path, demo=demo, verbose=verbose)
     else:
-        return download_split_seed_data(subject_ids, runs, project_path, fs_hr, fs_lr, seconds, verbose)
+        return load_seed_data(subject_ids, project_path, demo=demo, verbose=verbose)
+
+def clear_memory():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 # -------------------------------
 # EEGDataset for Super-Resolution EEG
@@ -205,74 +264,94 @@ class EEGDataset(Dataset):
     Dataset EEG preprocessato per Super-Resolution EEG (EEG BCI dataset).
     Genera segmenti LR (160/sr_factor Hz) e HR (160 Hz) sincronizzati.
     """
-    def __init__(self, subject_ids, data_folder, dataset_name = "mmi", fs_hr=160, fs_lr=16, seconds=10, verbose=False, demo=False, num_channels=64):
-
+    def __init__(self, subject_ids, data_folder, dataset_name = "mmi", sr_type="temporal", seconds=10, verbose=False, demo=False, num_channels=64, multiplier=2):
+        
         self.project_path = data_folder
-        self.fs_hr = fs_hr
-        self.fs_lr = fs_lr
-        self.sr_factor = int(fs_hr // fs_lr)
         self.verbose = verbose
         self.demo = demo
         self.seconds = seconds
-        self.lr_window_length = fs_lr * seconds
-        self.hr_window_length = fs_hr * seconds
         self.num_channels = num_channels    
         self.dataset_name = dataset_name
         self.runs = map_runs_dataset[self.dataset_name]
+        self.sr_type = sr_type  # 'temporal' or 'spatial'
+        self.multiplier = multiplier  # Downsampling factor for temporal or spatial SR
+        self.fs_hr = 160  if self.dataset_name == "mmi" else 200
+        self.hr_window_length = self.fs_hr * self.seconds  
 
-        #self.scaler_lr = MinMaxScaler(feature_range=(0, 1))
-        #self.scaler_hr = MinMaxScaler(feature_range=(0, 1))
+        self.scaler = StandardScaler()  #MinMaxScaler(feature_range=(0, 1))
 
-        self.data_lr, self.data_hr, self.raw_data, self.labels, self.positions = download_eegbci_data(
+        self.datas, self.labels, self.positions = download_eegbci_data(
             subject_ids, runs=self.runs, project_path=self.project_path,
-            dataset_name=self.dataset_name, fs_hr=self.fs_hr, fs_lr=self.fs_lr, seconds=self.seconds, verbose=self.verbose
+            demo=self.demo,
+            dataset_name=self.dataset_name, verbose=self.verbose
         )   
 
-        self.data_lr = self._zscore_normalization(torch.tensor(self.data_lr)).numpy()
-        self.data_hr = self._zscore_normalization(torch.tensor(self.data_hr)).numpy()
-        
-        print(self.data_lr.min(), self.data_lr.max())
-        print(self.data_hr.min(), self.data_hr.max())
-
         self.ref_position = self.positions[0]  # Assuming all raws have same channel positions
-        #self.data_lr = self._normalize_data(self.data_lr.reshape(-1, self.data_lr.shape[2]), self.scaler_lr).reshape(self.data_lr.shape)
-        #self.data_hr = self._normalize_data(self.data_hr.reshape(-1, self.data_hr.shape[2]), self.scaler_hr).reshape(self.data_hr.shape)
-        print(f"✅ Number of segments created: {len(self.data_lr)}")
 
-    # -------------------------------
-    # Z-score normalization
-    # -------------------------------
+        self.datas_hr, self.positions = self._split_windows(self.hr_window_length)
+        print(f"\n✅ Number of segments created: {len(self.datas_hr)}")
+        
+        self.datas_hr = self._zscore_normalization(torch.tensor(self.datas_hr)).numpy()
+        print(f"\nData z-score normalization complete: {self.datas_hr.shape}")
+        
+        #self.datas_hr = self._normalize_data(self.datas_hr.reshape(-1, self.datas_hr.shape[2]), self.scaler).reshape(self.datas_hr.shape)
+        #print(f"\nData normalization complete: {self.datas_hr.shape}")
+
     def _zscore_normalization(self, data):
-
         # Z-score per channel (common for EEG DL)
         mean = data.mean(dim=-1, keepdim=True)  # [B,C,1]
         std = data.std(dim=-1, keepdim=True)
-        std = torch.clamp(std, min=1e-6)  # Avoid div0
+        std = torch.clamp(std, min=1e-5)  # Avoid div0
         normalized = (data - mean) / std  # [-3,3] typical
         return normalized
     
     def _normalize_data(self, data, scaler):
         data_reshaped = data.T  # Shape: (num_samples, num_channels)
         data_normalized = scaler.fit_transform(data_reshaped)
-        return data_normalized.T  # Shape: (num_channels, num_samples)
-
-    # -------------------------------
-    # Dataset interface
-    # -------------------------------
+        return data_normalized.T  # Shape: (num_channels, num_samples)    
+    
+    def _downsample(self, data, factor):
+        _, num_samples = data.shape
+        downsampled_length = num_samples // factor
+        downsampled_data = signal.resample(data, downsampled_length, axis=1)
+        return downsampled_data
+    
+    def _split_windows(self, window_length, stride=None):  # stride=window_length for non-overlap
+        if stride is None:
+            stride = window_length  # Non-overlapping by default    
+        datas_hr = []
+        positions = []
+        labels = []
+        for i, data in enumerate(self.datas):  # self.datas = list of (C, T_i) arrays
+            print(f"Splitting data {i+1}/{len(self.datas)} (len={data.shape[1]})", end='\r')
+            position = self.positions[i]  # (C, 3)     
+            T = data.shape[1]
+            num_windows = (T - window_length) // stride + 1  # Floor div for valid windows
+            for j in range(num_windows):
+                start = j * stride
+                end = start + window_length
+                window = data[:, start:end].astype(np.float32)  # (C, window_length)
+                datas_hr.append(window)
+                positions.append(position)  # Same pos for all windows from this trial
+                labels.append(self.labels[i])
+        datas_hr = torch.tensor(np.array(datas_hr), dtype=torch.float32)  # (N_windows_total, C, W)
+        positions = torch.stack(positions)  # (N_windows_total, C, 3)
+        self.labels = torch.tensor(np.array(labels), dtype=torch.int32)
+        return datas_hr, positions
+        
     def __len__(self):
-        return len(self.data_lr)
+        return len(self.datas_hr)
 
     def __getitem__(self, idx):
-        
-        lr_data_64 = self.data_lr[idx]  
-        hr_data = self.data_hr[idx]
+        hr_data = self.datas_hr[idx]
         pos = self.positions[idx]
-
-        if self.num_channels != 64:
-            lr_data = get_lr_data(lr_data_64, num_channels=self.num_channels)
-        else:   
-            lr_data = lr_data_64
-        return lr_data, hr_data, pos
+        label = self.labels[idx]
+        if self.sr_type == "temporal":
+            lr_data = self._downsample(hr_data, self.multiplier)
+        else:  # spatial
+            lr_data = hr_data.copy() # numpy array
+            lr_data = get_lr_data(lr_data, num_channels=self.num_channels)
+        return lr_data, hr_data, pos, label
 
 def add_zero_channels(input_tensor, target_channels=64):
     """Add zero channels to input_tensor to match target_channels."""
@@ -299,18 +378,37 @@ def add_zero_channels(input_tensor, target_channels=64):
             input_target[:, ch, :] = input_tensor[:, i, :]
     return input_target
 
-def plot_umap_latent_space(model, eeg, labels, save_path=None, map_labels=None):
+def plot_umap_latent_space(model, dataloader, save_path=None, map_labels=None):
 
     # Get the latent space representations
     latent_vectors = []
-    with torch.no_grad():
-        model.eval()
-        device = next(model.parameters()).device
-        eeg = torch.tensor(eeg, dtype=torch.float32).to(device)
-        latent_vector = model(eeg, return_latent=True)[1]
-        latent_vector = latent_vector.view(latent_vector.size(0), -1)
-        print(latent_vector.shape)
+    labels = []
+
+    model.eval()
+    device = next(model.parameters()).device
+
+    for i, (eeg, eeg_hr, pos, label) in enumerate(dataloader):
+        print(f"Processing batch {i+1}/{len(dataloader)}", end='\r')
+        with torch.no_grad():
+            eeg = eeg.to(device)
+            eeg_hr = eeg_hr.to(device)
+            pos = pos.to(device)
+            if model.__class__.__name__ == "DiBiMa_Diff":
+                batch_size = eeg.size(0)
+                t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, device=eeg.device, dtype=torch.long) # (B,)
+                noise_hr = torch.randn_like(eeg_hr).to(device)
+                x_t_hr = model.scheduler.add_noise(eeg_hr, noise_hr, t).to(device)
+                latent_vector = model(x_t_hr, t, lr=eeg, pos=pos, return_latent=True)[-1]
+            else:
+                latent_vector = model(eeg, return_latent=True)[-1]
+            labels.extend(label.numpy())
+            del eeg, eeg_hr, pos
+            torch.cuda.empty_cache()
+            gc.collect()
+        
+        latent_vector = latent_vector.reshape(latent_vector.size(0), -1)
         latent_vectors.append(latent_vector.cpu().numpy())
+    
     latent_vectors = np.vstack(latent_vectors)
 
     reducer = UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=seed).fit(latent_vectors)
@@ -458,3 +556,4 @@ def generate_colors(n_colors: int = 1, method: str = 'hsv_uniform'):
             color = tuple(np.array(color) * np.array([1, sat, val]))
             colors.append(color)
         return colors
+    

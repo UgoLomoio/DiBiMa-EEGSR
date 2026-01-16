@@ -147,8 +147,9 @@ def nmse2d(original, reconstructed):
     return torch.mean(nmse).item()
 
 # Evaluation
-def evaluate_model(model, dataloader, n_timesteps=None):
-    
+def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
+
+    #evaluate_mean: if True, evaluate the mean signal as baseline
     model.eval()
 
     if getattr(model, 'parameters', None):
@@ -165,23 +166,38 @@ def evaluate_model(model, dataloader, n_timesteps=None):
 
     print("Evaluating model performances...")
     with torch.no_grad():
-        for lr_input, hr_target, pos in tqdm(dataloader, desc="Test", unit="seg", leave=False):
+        for lr_input, hr_target, pos, _ in tqdm(dataloader, desc="Test", unit="seg", leave=False):
             lr_input = lr_input.to(device)
             hr_target = hr_target.to(device)
             pos = pos.to(device)
+            if model.model.use_electrode_embedding:
+                pos = pos.float()
+            else:
+                pos = None
             #print(lr_input.shape, hr_target.shape)
             
             start = time.time()
-            if model.use_diffusion:
-                #print("Using diffusion model for inference...")
-                model_diff = DiBiMa_Diff(model).to(device)
-                sr_recon = model_diff.sample(lr_input, pos, num_inference_steps=n_timesteps)
+            if model.model.use_diffusion:
+                
+                batch_size = lr_input.size(0)
+                t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, device=hr_target.device, dtype=torch.long) # (B,)
+                # Diffuse HR
+                noise_hr = torch.randn_like(hr_target)
+                x_t_hr = model.scheduler.add_noise(hr_target, noise_hr, t)
+                # Model prediction (same signature as training)
+                sr_recon = model(x_t_hr, t, lr_input, pos)  # (B, C_HR, L')
+
             else:
                 #print("Using standard model for inference...")
                 sr_recon = model(lr_input)
+            
             inf_time = time.time() - start
             inf_times.append(inf_time)
   
+            if evaluate_mean:
+                # 1-channel mean signal as baseline
+                sr_recon = sr_recon.mean(dim=1, keepdim=True)
+                hr_target = hr_target.mean(dim=1, keepdim=True)
 
             mse = mse_crit(sr_recon, hr_target).item()
             mses.append(mse)
