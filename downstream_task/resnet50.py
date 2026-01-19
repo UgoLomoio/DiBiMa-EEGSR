@@ -1,9 +1,9 @@
 import torch
 import pytorch_lightning as pl
 
-class Bottlrneck(torch.nn.Module):
+class Bottleneck(torch.nn.Module):
     def __init__(self,In_channel,Med_channel,Out_channel,downsample=False):
-        super(Bottlrneck, self).__init__()
+        super(Bottleneck, self).__init__()
         self.stride = 1
         if downsample == True:
             self.stride = 2
@@ -40,25 +40,25 @@ class ResNet50(torch.nn.Module):
             torch.nn.Conv1d(in_channels,64,kernel_size=7,stride=2,padding=3),
             torch.nn.MaxPool1d(3,2,1),
 
-            Bottlrneck(64,64,256,False),
-            Bottlrneck(256,64,256,False),
-            Bottlrneck(256,64,256,False),
+            Bottleneck(64,64,256,False),
+            Bottleneck(256,64,256,False),
+            Bottleneck(256,64,256,False),
             #
-            Bottlrneck(256,128,512, True),
-            Bottlrneck(512,128,512, False),
-            Bottlrneck(512,128,512, False),
-            Bottlrneck(512,128,512, False),
+            Bottleneck(256,128,512, True),
+            Bottleneck(512,128,512, False),
+            Bottleneck(512,128,512, False),
+            Bottleneck(512,128,512, False),
             #
-            Bottlrneck(512,256,1024, True),
-            Bottlrneck(1024,256,1024, False),
-            Bottlrneck(1024,256,1024, False),
-            Bottlrneck(1024,256,1024, False),
-            Bottlrneck(1024,256,1024, False),
-            Bottlrneck(1024,256,1024, False),
+            Bottleneck(512,256,1024, True),
+            Bottleneck(1024,256,1024, False),
+            Bottleneck(1024,256,1024, False),
+            Bottleneck(1024,256,1024, False),
+            Bottleneck(1024,256,1024, False),
+            Bottleneck(1024,256,1024, False),
             #
-            Bottlrneck(1024,512,2048, True),
-            Bottlrneck(2048,512,2048, False),
-            Bottlrneck(2048,512,2048, False),
+            Bottleneck(1024,512,2048, True),
+            Bottleneck(2048,512,2048, False),
+            Bottleneck(2048,512,2048, False),
 
             torch.nn.AdaptiveAvgPool1d(1)
         )
@@ -80,6 +80,10 @@ class ResNetPL(pl.LightningModule):
         self.model = model
         self.criterion = torch.nn.CrossEntropyLoss()
         self.optimizer = optimizer
+        self.train_losses = []
+        self.val_losses = []
+        self.train_accs = []
+        self.val_accs = []
     
     def forward(self, x):
         return self.model(x)
@@ -87,17 +91,59 @@ class ResNetPL(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         inputs, targets = batch
         outputs = self(inputs)
+        targets = targets.long()
         loss = self.criterion(outputs, targets)
-        self.log('train_loss', loss)
+        self.train_losses.append(loss.item())
+        self.log('train_loss', loss, prog_bar=True)
+        acc = (outputs.argmax(dim=1) == targets).float().mean()
+        self.train_accs.append(acc.item())
+        self.log('train_acc', acc, prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         inputs, targets = batch
         outputs = self(inputs)
+        targets = targets.long()
         loss = self.criterion(outputs, targets)
-        self.log('val_loss', loss)
+        self.val_losses.append(loss.item())
+        acc = (outputs.argmax(dim=1) == targets).float().mean()
+        self.val_accs.append(acc.item())
+        return loss
+    
+    def on_train_epoch_start(self):
+        self.train_losses = []
+        self.train_accs = []
+        return super().on_train_epoch_start()
 
+    def on_validation_epoch_start(self):
+        self.val_losses = []
+        self.val_accs = []
+        return super().on_validation_epoch_start()
+    
+    def on_train_epoch_end(self):
+        avg_train_loss = sum(self.train_losses) / len(self.train_losses)
+        avg_train_acc = sum(self.train_accs) / len(self.train_accs)
+        self.log('avg_train_loss', avg_train_loss, prog_bar=True, on_epoch=True)
+        self.log('avg_train_acc', avg_train_acc, prog_bar=True, on_epoch=True)
+        return super().on_train_epoch_end()
+    
+    def on_validation_epoch_end(self):
+        avg_val_loss = sum(self.val_losses) / len(self.val_losses)
+        avg_val_acc = sum(self.val_accs) / len(self.val_accs)
+        self.log('avg_val_acc', avg_val_acc, prog_bar=True, on_epoch=True)
+        self.log('avg_val_loss', avg_val_loss, prog_bar=True, on_epoch=True)
+        return super().on_validation_epoch_end()
+    
     def configure_optimizers(self):
         optimizer = self.optimizer
         return optimizer
 
+    def predict(self, dataloader):
+        self.eval()
+        all_outputs = []
+        with torch.no_grad():
+            for batch in dataloader:
+                inputs, _ = batch
+                outputs = self(inputs)
+                all_outputs.append(outputs)
+        return torch.cat(all_outputs, dim=0)
