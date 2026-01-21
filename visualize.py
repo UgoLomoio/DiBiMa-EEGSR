@@ -115,11 +115,10 @@ def plot_mean_timeseries(timeseries, save_path=None):
     plt.ylabel('Amplitude')
     plt.grid()
     plt.legend()
-    plt.show()
     if save_path:
         fig.savefig(save_path, dpi=300)
         print(f"Saved figure to {save_path}")
-    
+    plt.close(fig)
 
 def plot_physionet_style(timeseries, save_path="physionet_style_visualization.png",
                          dataset_name="PhysioNet MMI"):

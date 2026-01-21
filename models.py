@@ -10,8 +10,8 @@ from mamba_ssm.models.mixer_seq_simple import _init_weights
 from mamba_ssm.ops.triton.layer_norm import RMSNorm
 from mamba_ssm import Mamba, Mamba2
 from mamba_ssm.modules.block import Block
-from utils import unmask_channels, add_zero_channels
- 
+from utils import add_zero_channels, unmask_channels
+
 project_path = os.path.dirname(os.path.abspath(__file__))
 
 # Device configuration
@@ -188,7 +188,8 @@ class SignalEncoder(nn.Module):
 class DiBiMa_nn(nn.Module):
     def __init__(self, target_channels, ref_position=None, num_channels=64, fs_lr=80, fs_hr=160, seconds=10,
                  residual_global=True, use_mamba=True, use_diffusion=False, use_positional_encoding=False, use_electrode_embedding=False,
-                 residual_internal=True, use_subpixel=True, sr_type="temporal", n_mamba_blocks = 1, n_mamba_layers=1, mamba_dim=64, mamba_d_state=16, mamba_version=1):
+                 residual_internal=True, use_subpixel=True, sr_type="temporal", n_mamba_blocks = 1, n_mamba_layers=1, mamba_dim=64, mamba_d_state=16,
+                 mamba_version=1, merge_type='concat'):
         super(DiBiMa_nn, self).__init__()
 
         self.target_channels = target_channels
@@ -208,6 +209,7 @@ class DiBiMa_nn(nn.Module):
         self.mamba_version = mamba_version
         self.n_mamba_blocks = n_mamba_blocks
         self.ref_position = ref_position
+        self.merge_type = merge_type
 
         if self.use_mamba:
             enc_in = int(self.mamba_dim/2)
@@ -257,12 +259,13 @@ class DiBiMa_nn(nn.Module):
                                                      d_state=self.mamba_d_state,
                                                      n_mamba_blocks=self.n_mamba_blocks,
                                                      n_layers=self.n_mamba_layers,
-                                                     mamba_version=self.mamba_version)
+                                                     mamba_version=self.mamba_version,
+                                                     merge_type=self.merge_type)
         else:
             print("Using simple bottleneck with residual internal")
             self.bottleneck = nn.Sequential(
-                    nn.Conv1d(enc_out, enc_out, kernel_size=1, padding=0),
-                    nn.BatchNorm1d(enc_out),
+                    nn.Conv1d(enc_out, enc_out*2, kernel_size=1, padding=0),
+                    nn.BatchNorm1d(enc_out*2),
                     nn.SiLU(),
                     nn.Dropout(0.3)
             )
@@ -272,11 +275,14 @@ class DiBiMa_nn(nn.Module):
             ks = 3
             pad = 1
             if self.use_mamba:
-                conv_d = nn.Conv1d(enc_out*2, enc_out, kernel_size=ks, padding=pad)
+                if self.merge_type == "concat":
+                    conv_d = nn.Conv1d(enc_out*2*n_mamba_layers, enc_out, kernel_size=ks, padding=pad)
+                else:
+                    conv_d = nn.Conv1d(enc_out, enc_out, kernel_size=ks, padding=pad)
                 batch_n = nn.BatchNorm1d(enc_out)
                 sub_pixel_in = enc_out
             else:
-                conv_d = nn.Conv1d(enc_out, enc_out, kernel_size=ks, padding=pad)
+                conv_d = nn.Conv1d(enc_out*2, enc_out, kernel_size=ks, padding=pad)
                 batch_n = nn.BatchNorm1d(enc_out)
                 sub_pixel_in = enc_out
 
@@ -476,9 +482,9 @@ class DiBiMa(pl.LightningModule):
         lr_input, hr_target, _, _ = batch
         sr_recon = self(lr_input)
         loss = self.compute_loss(sr_recon, hr_target)
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log('train_loss', loss, prog_bar=True)
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log('train_loss', loss, prog_bar=True)
         self.train_losses.append(loss)
         return loss
 
@@ -495,10 +501,10 @@ class DiBiMa(pl.LightningModule):
         
     def on_train_epoch_end(self):
         avg_loss = torch.stack(self.train_losses).mean()
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log('avg_train_loss', avg_loss, prog_bar=True, on_epoch=True)
-            self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log('avg_train_loss', avg_loss, prog_bar=True, on_epoch=True)
+        self.log("lr", self.optimizers().param_groups[0]['lr'], prog_bar=True)
         return super().on_train_epoch_end()
     
     def on_train_epoch_start(self):
@@ -508,16 +514,16 @@ class DiBiMa(pl.LightningModule):
 
     def on_validation_epoch_end(self):
         avg_loss = torch.stack(self.val_losses).mean()
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log('avg_val_loss', avg_loss, prog_bar=True, on_epoch=True)
-            if self.plot and self.lr_to_plot is not None and self.hr_to_plot is not None and self.pred_to_plot is not None:
-                self.ax_inout.clear()
-                self.ax_inout.plot(self.lr_to_plot.mean(dim=0), label="LRCondition")
-                self.ax_inout.plot(self.hr_to_plot.mean(dim=0), label="TargetHR")
-                self.ax_inout.plot(self.pred_to_plot.mean(dim=0), label="GeneratedHR")
-                self.ax_inout.legend()
-                self.fig_inout.canvas.draw()
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log('avg_val_loss', avg_loss, prog_bar=True, on_epoch=True)
+        if self.plot and self.lr_to_plot is not None and self.hr_to_plot is not None and self.pred_to_plot is not None:
+            self.ax_inout.clear()
+            self.ax_inout.plot(self.lr_to_plot.mean(dim=0), label="LRCondition")
+            self.ax_inout.plot(self.hr_to_plot.mean(dim=0), label="TargetHR")
+            self.ax_inout.plot(self.pred_to_plot.mean(dim=0), label="GeneratedHR")
+            self.ax_inout.legend()
+            self.fig_inout.canvas.draw()
         return super().on_validation_epoch_end()
 
     def on_validation_epoch_start(self):
@@ -533,17 +539,39 @@ class DiBiMa(pl.LightningModule):
 
 class BidirectionalMamba(nn.Module):
 
-    def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, n_layers=1, n_mamba_blocks = 1, mamba_version=1, device = 'cuda:0' if torch.cuda.is_available() else 'cpu'):
+    def __init__(self, d_model=256, d_state=16, d_conv=4, expand=2, n_layers=1, n_mamba_blocks = 1, mamba_version=1, merge_type = "concat", device = 'cuda:0' if torch.cuda.is_available() else 'cpu'):
         
         super().__init__()
         
         self.d_model = d_model
         self.n_layers = n_layers
         self.n_mamba_blocks = n_mamba_blocks
+        self.merge_type = merge_type
 
         self.forward_layers = nn.ModuleList([])
         self.backward_layers = nn.ModuleList([])
         self.device = device
+
+
+    
+        print("Multiple Bi-Mamba layers with convolutional residual connections are used.")
+        self.residual_convs = nn.ModuleList([])
+            
+        in_channels = d_model
+        for i in range(self.n_layers):
+            if self.merge_type == "concat":
+                out_channels = in_channels * 2
+            else:
+                out_channels = in_channels
+            self.residual_convs.append(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_channels,
+                    kernel_size=3,
+                    padding=1
+                ).to(self.device)
+            )
+            in_channels = out_channels
 
         for i in range(n_layers):
 
@@ -554,6 +582,11 @@ class BidirectionalMamba(nn.Module):
 
             fwd_blocks = nn.ModuleList([])
             bwd_blocks = nn.ModuleList([])
+            
+            if i > 0:
+                if self.merge_type == "concat":
+                    d_model *= 2
+
             for j in range(n_mamba_blocks):
                 fwd_blocks.append(
                         Block(
@@ -597,28 +630,46 @@ class BidirectionalMamba(nn.Module):
             back_residual = (backward_f + back_residual) if back_residual is not None else backward_f
 
             back_residual = torch.flip(back_residual, [1])
-            residual = torch.cat([residual, back_residual], -1)
+            if self.merge_type == "concat":
+                residual = torch.cat([residual, back_residual], -1)
+            else:
+                residual += back_residual
         
         return residual
 
     def forward(self, x, debug=False):  # [B, L, D]
+        # Optional: outermost residual
+        # residual_outer = x.clone()
         
-        #residual = x.clone()
         for i in range(self.n_layers):
-            #residual_inner = x.clone()
+            # Clone input to THIS layer (will be residual for NEXT layer)
+            residual_inner = x.clone()
+            if debug:
+                print(f"Layer {i} input/residual for next: {residual_inner.shape}")
+            
+            # Apply Bi-Mamba layer
             x = self._bimamba_layer(
                 x,
                 self.forward_layers[i],
                 self.backward_layers[i],
                 debug=debug
             )
-            #x = x + residual_inner
+            """
+            # connect PREV layer output (=this input) to this output                
+            residual_proj = self.residual_convs[i](residual_inner.transpose(1,2)).transpose(1,2)
             if debug:
-                print(f"After Bi-Mamba layer {i}: {x.shape}")
-        #x = x + residual
-        return x    
-
-
+                print(f"Before add layer {i}: x={x.shape}, residual={residual_proj.shape}")
+            
+            x += residual_proj         
+            if debug:
+                print(f"After residual add layer {i}: {x.shape}")
+            """
+            #x += residual_inner  # direct residual add
+        if debug:
+            print(f"Layer {i} output: {x.shape}")
+        
+        # Optional: x += residual_outer
+        return x
 
 from diffusers import DDPMScheduler
 import matplotlib.pyplot as plt
@@ -722,7 +773,8 @@ class DiBiMa_Diff(pl.LightningModule):
         # x0_hr: clean HR EEG, shape (B, C_HR, L)
         noise_hr = torch.randn_like(hr)
         t = torch.randint(0, self.scheduler.num_train_timesteps, (batch_size,), device=hr.device, dtype=torch.long) # (B,)
-        x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)  # (B, C_HR, L)
+        #x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)  # (B, C_HR, L)
+        x_t_hr = noise_hr  # Start from pure noise  
         
         # Model prediction
         output = self(x_t_hr, t, lr, pos)  # (B, C_HR, L)
@@ -738,9 +790,9 @@ class DiBiMa_Diff(pl.LightningModule):
             # Predict x0 (clean sample)
             loss = self.compute_loss(output, hr)
 
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log("train_loss", loss, prog_bar=True)
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log("train_loss", loss, prog_bar=True)
         self.train_losses.append(loss.item())
 
         if self.debug:
@@ -764,7 +816,8 @@ class DiBiMa_Diff(pl.LightningModule):
 
         # Diffuse HR
         noise_hr = torch.randn_like(hr)
-        x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)
+        #x_t_hr = self.scheduler.add_noise(hr, noise_hr, t)
+        x_t_hr = noise_hr  # Start from pure noise  
 
         # Model prediction (same signature as training)
         output = self(x_t_hr, t, lr, pos)  # (B, C_HR, L')
@@ -798,19 +851,19 @@ class DiBiMa_Diff(pl.LightningModule):
         return super().on_train_epoch_start()
     
     def on_train_epoch_end(self):
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log("avg_train_loss", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_epoch=True)
-            sch = self.lr_schedulers()
-            if sch:
-                self.log("lr", sch.get_last_lr()[0], prog_bar=True)
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log("avg_train_loss", torch.mean(torch.tensor(self.train_losses)), prog_bar=True, on_epoch=True)
+        sch = self.lr_schedulers()
+        if sch:
+            self.log("lr", sch.get_last_lr()[0], prog_bar=True)
         return super().on_train_epoch_end()
     
     def on_validation_epoch_end(self):
         
-        torch.no_grad_context_manager = torch.no_grad()
-        with torch.no_grad():
-            self.log("avg_val_loss", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_epoch=True)
+        #torch.no_grad_context_manager = torch.no_grad()
+        #with torch.no_grad():
+        self.log("avg_val_loss", torch.mean(torch.tensor(self.val_losses)), prog_bar=True, on_epoch=True)
         
         lr = self.lr_to_plot
         hr = self.hr_to_plot
@@ -882,7 +935,7 @@ class DiBiMa_Diff(pl.LightningModule):
         lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=self.epochs,
-            eta_min=1e-3
+            eta_min=1e-5
         )
 
         return {
@@ -927,3 +980,14 @@ class DiBiMa_Diff(pl.LightningModule):
             return torch.stack(samples, dim=1)
         else:
             return x
+
+    def predict(self, hr_data, lr_data, pos=None):
+        batch_size = hr_data.size(0)
+        t = torch.full((batch_size,), self.scheduler.num_train_timesteps - 1, device=hr_data.device, dtype=torch.long) # (B,)
+        # Diffuse HR
+        noise_hr = torch.randn_like(hr_data)
+        #x_t_hr = self.scheduler.add_noise(hr_data, noise_hr, t)
+        x_t_hr = noise_hr  # Start from pure noise
+        # Model prediction (same signature as training)
+        output = self(x_t_hr, t, lr_data, pos=pos)  # (B, C_HR, L') 
+        return output

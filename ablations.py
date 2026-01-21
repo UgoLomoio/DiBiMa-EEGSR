@@ -12,7 +12,7 @@ from tabulate import tabulate
 import mne
 from pytorch_lightning import Trainer
 import torchinfo 
-from visualize import plot_mean_timeseries, plot_mean_timeseries_plotly
+from visualize import plot_mean_timeseries
 from utils import unmask_channels
 import gc 
 from torch.cuda import empty_cache
@@ -29,7 +29,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Hyperparameters
 batch_size = 32
-epochs = 1
+epochs = 30
 learning_rate = 0.001 #0.001
 seed = 2
 seconds = 10 #2 #9760 samples /160 Hz = 61 seconds
@@ -39,12 +39,12 @@ nfolds = 1 # Number of folds for cross-validation
 
 torch.set_float32_matmul_precision('high')  # For better performance on GPUs with Tensor Cores
 
-demo = True # Set to True for a quick demo run
+demo = False # Set to True for a quick demo run
 debug = False  # Set to True to enable debug mode with additional logging
 
 if demo:
     print("Demo mode activated: Using smaller dataset and fewer epochs for quick testing.")
-    epochs = 2
+    epochs = 1
     quick_load = False
     nfolds = 1
 
@@ -72,7 +72,7 @@ n_mamba_blocks = [1, 3, 5]  # Number of Mamba blocks in each Bi-Mamba layer
 mamba_versions = [1, 2]  # Mamba version to use (1 or 2), 3 is not implemented yet but exists
 mamba_dims = [32, 64, 128]  # Mamba dimension (number of channels in Mamba layer)
 mamba_d_state = [8, 16, 32] # Mamba state dimension (number of channels in Mamba state)
-n_mamba_layers = [1]  # Number of Bi-Mamba layers in the model
+n_mamba_layers = [1, 2]  # Number of Bi-Mamba layers in the model
 mamba_presence = [True, False]  # Whether to include Mamba layers or not
 diffusion_presence = [True, False]  # Whether to include Diffusion or not
 
@@ -83,15 +83,16 @@ best_params = {
     "dim": 64, #64,  
     "d_state": 8, #16,  
     "n_mamba_blocks": 2, #5
-    "n_mamba_layers": 1,
+    "n_mamba_layers": 2, #1
     "use_mamba": True,
     "use_diffusion": True,
-    "use_electrode_embedding": True
+    "use_electrode_embedding": True,
+    'merge_type': 'add'  # 'concat' or 'add'
 }
 best_params = None  # Set to None to perform full HPO
 
 if best_params is not None:
-    epochs = 10  # Increase epochs if using best params directly
+    epochs = 20  # Increase epochs if using best params directly
 
 def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, data_folder, quick_load=True, ref_position=None):
 
@@ -128,9 +129,9 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
             prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
             diffusion_params = {
                     "num_train_timesteps": n_timesteps, #100,
-                    "beta_start": 1e-5, 
-                    "beta_end": 1e-2,        #1e-3                                                                               
-                    "beta_schedule": "linear",
+                    "beta_start": 1e-4,     #1e-5
+                    "beta_end": 1e-2,        #1e-2                                                                               
+                    "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
                     "prediction_type": prediction_type,
                     #"clip_sample": True,
                     #"clip_sample_range": 1,
@@ -143,17 +144,30 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
                                         predict_type=prediction_type,  # "epsilon" or "sample"
                                         debug=debug,
                                         epochs=epochs,
-                                        plot=True).to(device)
+                                        plot=False).to(device)
 
     if quick_load:
         return models 
     else:       
         return models, dataloader_train, dataloader_test
 
+
+def select_best_model(results, configs, metric_key="NMSE", selected_name=""):
+    if metric_key in ["MSE", "NMSE", "MAE"]:
+        # Lower is better
+        best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
+    else:
+        # Higher is better
+        best_config = max(configs, key=lambda c: results[c["name"]][metric_key])
+    best_param = best_config[selected_name]
+    best_model_name = best_config["name"]
+    best_results = results[best_model_name]
+    return best_param, best_config, best_results
+
 def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patients, data_folder,
                         fs_lr=20, seconds=10, fs_hr=160, target_channels=64, input_channels=16,
                         mamba_versions=[1, 2], mamba_dims=[64,128,256], mamba_d_state=[16,64], 
-                        n_mamba_layers=[1], n_mamba_blocks=[1, 2, 3], metric_key="val_mse", multiplier = 8):
+                        n_mamba_layers=[1], n_mamba_blocks=[1, 2, 3], metric_key="NMSE", multiplier = 8):
     """
     Sequential HPO: version → dim → d_state → n_layers.
     
@@ -183,13 +197,14 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
                 use_positional_encoding=False,
                 use_electrode_embedding=False, #changing to True in the final ablation
                 sr_type=sr_type,
-                use_diffusion=cfg["use_diffusion"],
-                use_mamba=cfg["use_mamba"],
-                n_mamba_blocks=cfg["n_mamba_blocks"],
-                n_mamba_layers=cfg["n_mamba_layers"],
-                mamba_dim=cfg["mamba_dim"],
-                mamba_d_state=cfg["mamba_d_state"],
-                mamba_version=cfg["mamba_version"],
+                use_diffusion=bool(cfg["use_diffusion"]),
+                use_mamba=bool(cfg["use_mamba"]),
+                n_mamba_blocks=int(cfg["n_mamba_blocks"]),
+                n_mamba_layers=int(cfg["n_mamba_layers"]),
+                mamba_dim=int(cfg["mamba_dim"]),
+                mamba_d_state=int(cfg["mamba_d_state"]),
+                mamba_version=int(cfg["mamba_version"]),
+                merge_type='add'  # 'concat' or 'add'
         )        
         if (dataloader_train is not None) and (dataloader_test is not None):
             quick_load = True
@@ -220,7 +235,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results, dataloader_train, dataloader_test = run_search(configs, ablation_type="mamba_version", fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, dataloader_train=None, dataloader_test=None)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mamba_version_results_fold{fold+1}_{dataset_name}.csv'))
-    best_version = min(configs, key=lambda c: results[c["name"]][metric_key])["mamba_version"]
+    best_version, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_version")
     print(f"✓ Best version: {best_version}")
     
     
@@ -230,7 +245,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_dim", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambadim_fold{fold+1}_{dataset_name}.csv'))
-    best_dim = min(configs, key=lambda c: results[c["name"]][metric_key])["mamba_dim"]
+    best_dim, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_dim")
     print(f"✓ Best dim: {best_dim}")
         
     # Stage 3: mamba_d_state
@@ -239,7 +254,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels,  ablation_type="mamba_d_state", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambadstate_fold{fold+1}_{dataset_name}.csv'))
-    best_d_state = min(configs, key=lambda c: results[c["name"]][metric_key])["mamba_d_state"]
+    best_d_state, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_d_state")
     print(f"✓ Best d_state: {best_d_state}")
         
     # Stage 4: n_mamba_blocks
@@ -250,8 +265,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_blocks", dataloader_train=dataloader_train, dataloader_test=dataloader_test)      
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambanblocks_fold{fold+1}_{dataset_name}.csv'))
-    best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
-    best_namba_blocks = best_config["n_mamba_blocks"]
+    best_namba_blocks, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="n_mamba_blocks")
     print(f"✓ Best n_mamba_blocks: {best_namba_blocks}")   
 
     # Stage 5: n_mamba_layers
@@ -261,31 +275,29 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_layers", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambanlayers_fold{fold+1}_{dataset_name}.csv'))
-    best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
-    best_n_mamba_layers = best_config["n_mamba_layers"]
+    best_n_mamba_layers, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="n_mamba_layers")
     print(f"✓ Best n_mamba_layers: {best_n_mamba_layers}")
 
     #Stage 6: Mamba Presence
     configs = [
-        {"name": f"{sr_nam}_with_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_config['n_mamba_layers']}", "use_mamba": True, "use_diffusion": False,
-        "n_mamba_layers": best_config["n_mamba_layers"], "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version},
+        {"name": f"{sr_nam}_with_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_n_mamba_layers}", "use_mamba": True, "use_diffusion": False,
+        "n_mamba_layers": best_n_mamba_layers, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version},
         {"name": f"{sr_nam}_no_mamba", "use_mamba": False, "use_diffusion": False, 
         "n_mamba_layers": 0, "n_mamba_blocks": 0, "mamba_dim": 0, "mamba_d_state": 0, "mamba_version": 0}
     ]
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_presence", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambapresence_fold{fold+1}_{dataset_name}.csv'))
-    best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
-    best_mamba_presence = best_config["use_mamba"]
+    best_mamba_presence, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_mamba")
     print(f"✓ Best mamba presence: {best_mamba_presence}")
 
     #Stage 7: Diffusion Presence
     if best_mamba_presence:  # Mamba was used
         configs = [
-            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_config['n_mamba_layers']}_no_diffusion", "use_mamba": True, "use_diffusion": False,
-            "n_mamba_layers": best_config["n_mamba_layers"], "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version},
-            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_config['n_mamba_layers']}_with_diffusion", 
-            "use_mamba": True, "use_diffusion": True, "n_mamba_layers": best_config["n_mamba_layers"], "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version}
+            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_n_mamba_layers}_no_diffusion", "use_mamba": True, "use_diffusion": False,
+            "n_mamba_layers": best_n_mamba_layers, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version},
+            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_n_mamba_layers}_with_diffusion", 
+            "use_mamba": True, "use_diffusion": True, "n_mamba_layers": best_n_mamba_layers, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version}
         ]
     else:
         configs = [
@@ -297,31 +309,28 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="diffusion_presence", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_diffusionpresence_fold{fold+1}_{dataset_name}.csv'))
-    best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
-    best_diff_presence = best_config["use_diffusion"]
+    best_diff_presence, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_diffusion")
     print(f"✓ Best diffusion presence: {best_diff_presence}")
         
-    results_diff_no_electrode = results[best_config["name"]].copy()  # Save results before electrode position embedding ablation
+    results_diff_no_electrode = best_results.copy()  # Save no electrode embedding results for later
 
     # Stage 8: Electrode Position Embedding conditioning
     if best_diff_presence:  # Mamba was used
         configs = [
-            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_config['n_mamba_layers']}_with_posenc", "use_mamba": best_mamba_presence, "use_diffusion": True,
-            "n_mamba_layers": best_config["n_mamba_layers"], "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version, "use_electrode_embedding": True},
+            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_n_mamba_layers}_with_posenc", "use_mamba": best_mamba_presence, "use_diffusion": True,
+            "n_mamba_layers": best_n_mamba_layers, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version, "use_electrode_embedding": True},
         ]
         results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="electrode_position_embedding", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
         results["no_electrode_position_embedding"] = results_diff_no_electrode  # Add back the no electrode embedding results
         df = pd.DataFrame(results).T
         df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_electrode_position_embedding_fold{fold+1}_{dataset_name}.csv'))
-        best_config = min(configs, key=lambda c: results[c["name"]][metric_key])
-        best_electrode_embedding = best_config.get("use_electrode_embedding", False)
+        best_electrode_embedding, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_electrode_embedding")
         print(f"✓ Best electrode position embedding: {best_electrode_embedding}")
     else:
         best_electrode_embedding = False  # No electrode embedding if no diffusion
-
-    best_results = results[best_config["name"]]
+        best_config["use_electrode_embedding"] = best_electrode_embedding
     
-    if best_version == 0:
+    if best_version == 0:   
         print(f"\n🎯 FINAL BEST: No Mamba used, diffusion_presence={best_diff_presence}, use_electrode_embedding: {best_electrode_embedding}")
     else:
         print(f"\n🎯 FINAL BEST: version={best_version}, dim={best_dim}, d_state={best_d_state}, n_blocks={best_namba_blocks}, n_layers={best_n_mamba_layers}, diffusion_presence={best_diff_presence}, use_electrode_embedding={best_electrode_embedding}")
@@ -564,7 +573,7 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                     fs_lr=fs_lr if sr_type == "temporal" else fs_hr,
                     fs_hr=fs_hr,
                     seconds=seconds,
-                    residual_global=True,
+                    residual_global=False,
                     residual_internal=True,
                     use_subpixel=True,
                     sr_type=sr_type,
@@ -577,6 +586,7 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                     n_mamba_blocks=best_params["n_mamba_blocks"],
                     use_positional_encoding=False,
                     use_electrode_embedding=best_params["use_electrode_embedding"],  
+                    merge_type=best_params['merge_type']
                 )
                 if dataloader_train is None or dataloader_test is None:
                     models, dataloader_train, dataloader_test = prepare_dataloaders(
@@ -589,7 +599,7 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                         dataset_name, models_nn, train_patients, test_patients,
                         data_folder, quick_load=True, ref_position=ref_position
                     )
-                _, results = train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, multiplier=multiplier, ablation_type="Final")
+                _, results = train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, multiplier=multiplier, ablation_type="Final", plot_one_example=False)
                 results_final[sr_type][fold+1] = results
             else:
                 clear_memory()
@@ -597,17 +607,20 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                     dataset_name=dataset_name,
                     sr_type=sr_type,
                     fold=fold,
+                    target_channels=64 if dataset_name=="mmi" else 62,
+                    input_channels=target_channels if sr_type == "temporal" else input_channels,
+                    fs_lr=fs_lr if sr_type == "temporal" else fs_hr,
+                    fs_hr=fs_hr,
+                    seconds=seconds,
                     train_patients=train_patients,
                     test_patients=test_patients,
                     data_folder=data_folder,
-                    metric_key="NMSE",
+                    metric_key="PCC",
                     mamba_versions=mamba_versions,
                     mamba_dims=mamba_dims,
                     mamba_d_state=mamba_d_state,
                     n_mamba_layers=n_mamba_layers,
                     n_mamba_blocks=n_mamba_blocks,
-                    target_channels=target_channels,
-                    input_channels=input_channels,
                 )
                 # Access best params:
                 print(f"Best: {best_hpo['best_config']}")
@@ -619,7 +632,7 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
     final_validation(dataset_name, results_final, nfolds=nfolds, ablations_path=ablations_path)
 
 def main():
-    dataset_names = ["mmi", "seed"]
+    dataset_names = ["seed"] # ["mmi", "seed"]
     multiplier = 8
     for dataset_name in dataset_names:
         print(f"\n\n########## Running Ablation Study for Dataset: {dataset_name} ##########")
@@ -629,7 +642,7 @@ def main():
         else:
             fs_hr = 200
             target_channels = 62
-        input_channels = target_channels // multiplier  #only spatial sr 
+        input_channels = math.ceil(target_channels / multiplier)  #for spatial sr #62/8=7.75 -> 8
         fs_lr = fs_hr // multiplier
         run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channels, multiplier, nfolds=nfolds)
         break

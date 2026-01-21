@@ -1,5 +1,4 @@
 
-from operator import __getitem__
 import os
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler, StandardScaler
@@ -13,8 +12,9 @@ import matplotlib.pyplot as plt
 from umap import UMAP
 import random
 import gc
-
 import torch
+import scipy
+
 # Set random seeds for reproducibility
 seed = 2
 np.random.seed(seed)
@@ -34,22 +34,6 @@ map_runs_dataset = {
     "seed": None  # All files in folder
 }
 
-map_runs_mmi = {
-    1: 'eyes_open',
-    2: 'eyes_closed',
-    3: 'task1',
-    4: 'task2',
-    5: 'task3',
-    6: 'task4',
-    7: 'task1',
-    8: 'task2',
-    9: 'task3',
-    10: 'task4',
-    11: 'task1',   
-    12: 'task2',
-    13: 'task3',
-    14: 'task4'
-}
 map_tasks = {
     'task1': 'open-close right or left fist',
     'task3': 'open-close both fists or both feet',
@@ -57,18 +41,58 @@ map_tasks = {
     'task4': 'imagine both fists or both feet'
 }
 
+map_runs_mmi = {
+    1: 'eyes_open',
+    2: 'eyes_closed',
+    3: map_tasks['task1'],
+    4: map_tasks['task2'],
+    5: map_tasks['task3'],
+    6: map_tasks['task4'],
+    7: map_tasks['task1'],
+    8: map_tasks['task2'],
+    9: map_tasks['task3'],
+    10: map_tasks['task4'],
+    11: map_tasks['task1'],   
+    12: map_tasks['task2'],
+    13: map_tasks['task3'],
+    14: map_tasks['task4']
+}
+
+map_labels_mmi = {
+                'eyes_open': 0,
+                'eyes_closed': 1,
+                'open-close right or left fist': 2,
+                'open-close both fists or both feet': 3,
+                'imagine right or left fist': 4,
+                'imagine both fists or both feet': 5
+}
+map_labels_mmi_rev = {v: k for k, v in map_labels_mmi.items()}
+
+
 map_annotations = {
     "T0": "rest",
     "T1": "right or left fist",
     "T2": "both fists or both feet"
 }
 
-def get_lr_data(eeg_64, num_channels=8):
+def get_lr_data_temporal(eeg_hr, factor=2):
+    """Downsample high-res EEG temporally by factor."""
+    if eeg_hr.ndim == 2:
+        _, num_samples = eeg_hr.shape
+    elif eeg_hr.ndim == 3:
+        _, _, num_samples = eeg_hr.shape
+    downsampled_length = num_samples // factor
+    eeg_lr = signal.resample(eeg_hr, downsampled_length, axis=-1)
+    return eeg_lr
+
+def get_lr_data_spatial(eeg_64, num_channels=8):
     
     """Extract low-res from 64ch EEG using unmask_channels"""
     indices = unmask_channels[num_channels]
-    return eeg_64[indices, :]
-
+    if eeg_64.ndim == 2:
+        return eeg_64[indices, :]
+    elif eeg_64.ndim == 3:
+        return eeg_64[:, indices, :]
 # -------------------------------
 # Preprocessing MNE
 # -------------------------------
@@ -91,16 +115,63 @@ def get_electrode_positions(raw, channel_order=None):
     locs = torch.tensor(locs, dtype=torch.float32)  # (C_eeg, 3)
     return locs
 
-def download_mmi_data(subject_ids, runs, project_path, demo = False, verbose=False):
+def set_montage(signal, dataset_name, sr_type, label, pos, channel_names, fs):
+    
+    # Find and drop T9/T10 from BOTH signal and channel_names (mmi-specific)
+    # if dataset_name == "mmi":
+    #    drop_idx = [i for i, ch in enumerate(channel_names) if ch in ['T9', 'T10']]
+    #    signal = np.delete(signal, drop_idx, axis=0)  # Remove rows: 64→62
+    #    channel_names = [ch for ch in channel_names if ch not in ['T9', 'T10']]  # 64→62
+        
+    #    print(f"Dropped {len(drop_idx)} channels, signal now {signal.shape}, names {len(channel_names)}")  # Debug
+    
+    info = mne.create_info(ch_names=channel_names, sfreq=fs, ch_types='eeg')
+    
+    if sr_type == 'spatial':
+        if "LR" in label:
+            input_channels = signal.shape[0]
+            selected_channels = unmask_channels[input_channels]
+            if pos.ndim == 2:
+                pos_subset = pos[selected_channels, :].cpu().detach().numpy()
+            else:
+                pos_subset = pos[0, selected_channels, :].cpu().detach().numpy()
+            montage = mne.channels.make_dig_montage(
+                ch_pos={ch_name: pos_subset[i] for i, ch_name in enumerate(channel_names)},
+                coord_frame='head'
+            )
+        else:
+            if dataset_name == 'mmi':
+                montage = mne.channels.make_standard_montage('standard_1020')
+            else:
+                montage = mne.channels.read_custom_montage('./eeg_data/seed/channel_62_pos.locs')
+    else:  # temporal or None
+        if dataset_name == 'mmi':
+            montage = mne.channels.make_standard_montage('standard_1020')
+        else:
+            montage = mne.channels.read_custom_montage('./eeg_data/seed/channel_62_pos.locs')
+    
+    info.set_montage(montage)  # Now matches perfectly
+    raw = mne.io.RawArray(signal, info)
+    
+    return raw
+
+def download_mmi_data(subject_ids, runs, project_path, demo = False, verbose=False, is_classification=False):
 
     datas = []
     labels = []
     positions = []
+    channel_names = None
 
     for i, subject in enumerate(subject_ids):
         #print(f"Processing subject {subject}")
         print(f"⬇️  Downloading/Reading data for subject: {i+1}/{len(subject_ids)}", end='\r')
+        if demo:
+            if i == 1:
+                break  # For demo, process only first subject
         for run in runs:
+            if is_classification and run not in [1, 2]:
+                continue  # Skip non-classification runs
+
             local_path = os.path.join(project_path, f'S{subject:03d}R{run:02d}.edf')
             #print(f"Checking local path: {local_path}")
             if not os.path.exists(local_path):
@@ -120,27 +191,25 @@ def download_mmi_data(subject_ids, runs, project_path, demo = False, verbose=Fal
                     continue
             try:
                 raw = mne.io.read_raw_edf(local_path, preload=True, verbose=verbose)
-                mne.datasets.eegbci.standardize(raw)  # Rename to 10-20 approx: e.g., 'C3-Lapl' -> 'C3'
-                montage = mne.channels.make_standard_montage('standard_1020')
-                raw.set_montage(montage, on_missing='ignore', match_case=False)  # Ignore extras, case-insensitive[web:87]
+                mne.datasets.eegbci.standardize(raw) 
+                signal = raw.get_data()
+                if channel_names is None:
+                    channel_names = raw.ch_names
+                raw = set_montage(signal, "mmi", sr_type=None, label="HR", pos=None, channel_names=channel_names, fs=160)
 
                 raw = _preprocess_raw(raw, verbose=verbose)
                 data = raw.get_data()
                 data = data*1e6  # scale to microvolts
                 data = data.astype(np.float32)
                 datas.append(data)
-                label = run#map_runs_mmi[run]
+                label = map_runs_mmi[run]
                 labels.append(label)
                 position = get_electrode_positions(raw, channel_order=None)
                 positions.append(position)
-            
+
             except Exception as e:
                 print(f"⚠️ Exception during processing {local_path}: {e}")
                 continue
-        
-        if demo:
-            if i == 1:
-               break  # For demo
 
     # Clean up downloaded files
     path_to_remove = os.path.join(
@@ -150,14 +219,13 @@ def download_mmi_data(subject_ids, runs, project_path, demo = False, verbose=Fal
     if os.path.exists(path_to_remove):
         shutil.rmtree(path_to_remove)
 
-    labels = np.array(labels, dtype=np.int32)
-    labels = torch.tensor(labels)
+    labels = [map_labels_mmi[lbl] for lbl in labels]
+    labels = torch.tensor(np.array(labels), dtype=torch.int32)
     positions = np.array(positions)
     positions = torch.tensor(positions, dtype=torch.float32)
-    return datas, labels, positions
+    return datas, labels, positions, channel_names
 
 def load_mat(filepath):
-    import scipy.io
     mat = scipy.io.loadmat(filepath)
     return mat
 
@@ -168,7 +236,7 @@ def load_seed_channel_positions(filepath):
         for line in f:
             parts = line.strip().split()
             if len(parts) >= 4:
-                ch_name = parts[0]  # Or parts[-1] if label last
+                ch_name = parts[-1]  # Or parts[-1] if label last
                 theta_deg = float(parts[1])  # Azimuth, negative=left
                 phi_frac = float(parts[2])   # Elevation fraction (~0-0.6)
                 phi_rad = np.radians(phi_frac * 90)  # Adjust scale to ~90° max
@@ -196,6 +264,9 @@ def load_seed_data(subject_ids, project_path, demo=False, verbose=False):
     for file in files:
         for subject in subject_ids:
             print(f"Processing subject {i+1}/{len(subject_ids)}", end='\r')
+            if demo:
+                if i == 1:
+                    break  # For demo, process only first subject
             if file.startswith(f'{int(subject)}_'):
                 filepath = os.path.join(seed_datapath, file)
                 try:
@@ -209,7 +280,9 @@ def load_seed_data(subject_ids, project_path, demo=False, verbose=False):
                         for key in eeg_keys:
                             
                             data = data_hr[key]  # Shape: (channels, samples)
-                            raw = mne.io.RawArray(data, mne.create_info(ch_names=channels, sfreq=sfreq, ch_types='eeg'))
+                            #raw = mne.io.RawArray(data, mne.create_info(ch_names=channels, sfreq=sfreq, ch_types='eeg'))
+                            raw = set_montage(data, "seed", sr_type=None, label="HR", pos=None, channel_names=channels, fs=sfreq)
+                            
                             raw = _preprocess_raw(raw, verbose=verbose)
 
                             data = raw.get_data()
@@ -220,20 +293,16 @@ def load_seed_data(subject_ids, project_path, demo=False, verbose=False):
                             positions.append(torch.tensor(position, dtype=torch.float32))
 
                     i += 1
-                    break  # Move to next file after processing current subject
                 except Exception as e:
                     print(f"⚠️ Exception during processing {filepath}: {e}")
-            if demo:
-                if i == 1:
-                    break  # For demo, process only first subject
 
     positions = np.array(positions)
     positions = torch.tensor(positions, dtype=torch.float32)
     labels = np.array(labels, dtype=np.int32)
     labels = torch.tensor(labels)
-    return datas, labels, positions
+    return datas, labels, positions, channels
 
-def download_eegbci_data(subject_ids, runs, project_path, demo=False, dataset_name="mmi", verbose=False):
+def download_eegbci_data(subject_ids, runs, project_path, demo=False, dataset_name="mmi", is_classification=False, verbose=False):
     """
     Scarica i dati EEG BCI per i soggetti e le sessioni specificate.
     Salva i file EDF localmente in project_path.
@@ -242,7 +311,7 @@ def download_eegbci_data(subject_ids, runs, project_path, demo=False, dataset_na
         raise ValueError("Dataset not supported. Use 'mmi' or 'seed'.")
     
     if dataset_name.lower() == "mmi":
-        return download_mmi_data(subject_ids, runs, project_path, demo=demo, verbose=verbose)
+        return download_mmi_data(subject_ids, runs, project_path, demo=demo, verbose=verbose, is_classification=is_classification)
     else:
         return load_seed_data(subject_ids, project_path, demo=demo, verbose=verbose)
 
@@ -280,10 +349,10 @@ class EEGDataset(Dataset):
 
         self.scaler = StandardScaler()  #MinMaxScaler(feature_range=(0, 1))
 
-        self.datas, self.labels, self.positions = download_eegbci_data(
+        self.datas, self.labels, self.positions, self.channel_names = download_eegbci_data(
             subject_ids, runs=self.runs, project_path=self.project_path,
             demo=self.demo,
-            dataset_name=self.dataset_name, verbose=self.verbose
+            dataset_name=self.dataset_name, verbose=self.verbose, is_classification=False
         )   
 
         self.ref_position = self.positions[0]  # Assuming all raws have same channel positions
@@ -293,9 +362,8 @@ class EEGDataset(Dataset):
         
         self.datas_hr = self._zscore_normalization(torch.tensor(self.datas_hr)).numpy()
         print(f"\nData z-score normalization complete: {self.datas_hr.shape}")
-        
-        #self.datas_hr = self._normalize_data(self.datas_hr.reshape(-1, self.datas_hr.shape[2]), self.scaler).reshape(self.datas_hr.shape)
-        #print(f"\nData normalization complete: {self.datas_hr.shape}")
+        self.datas_hr = self._normalize_data()
+        print(f"\nData normalization complete: {self.datas_hr.shape}")
 
     def _zscore_normalization(self, data):
         # Z-score per channel (common for EEG DL)
@@ -305,16 +373,20 @@ class EEGDataset(Dataset):
         normalized = (data - mean) / std  # [-3,3] typical
         return normalized
     
-    def _normalize_data(self, data, scaler):
-        data_reshaped = data.T  # Shape: (num_samples, num_channels)
-        data_normalized = scaler.fit_transform(data_reshaped)
-        return data_normalized.T  # Shape: (num_channels, num_samples)    
+    def _normalize_data(self):
+        data_normalized = []
+        for data in self.datas_hr:
+            data_reshaped = data.T  # Shape: (num_samples, num_channels)
+            data_norm = self.scaler.fit_transform(data_reshaped)
+            data_normalized.append(torch.tensor(data_norm.T))  # Shape: (num_channels, num_samples)
+        data_normalized = torch.stack(data_normalized)
+        return data_normalized    
     
     def _downsample(self, data, factor):
         _, num_samples = data.shape
         downsampled_length = num_samples // factor
         downsampled_data = signal.resample(data, downsampled_length, axis=1)
-        return downsampled_data
+        return downsampled_data        
     
     def _split_windows(self, window_length, stride=None):  # stride=window_length for non-overlap
         if stride is None:
@@ -349,8 +421,11 @@ class EEGDataset(Dataset):
         if self.sr_type == "temporal":
             lr_data = self._downsample(hr_data, self.multiplier)
         else:  # spatial
-            lr_data = hr_data.copy() # numpy array
-            lr_data = get_lr_data(lr_data, num_channels=self.num_channels)
+            if isinstance(hr_data, torch.Tensor):
+                lr_data = hr_data.clone()
+            else:
+                lr_data = hr_data.copy() # numpy array
+            lr_data = get_lr_data_spatial(lr_data, num_channels=self.num_channels)
         return lr_data, hr_data, pos, label
 
 def add_zero_channels(input_tensor, target_channels=64):
@@ -378,98 +453,95 @@ def add_zero_channels(input_tensor, target_channels=64):
             input_target[:, ch, :] = input_tensor[:, i, :]
     return input_target
 
-def plot_umap_latent_space(model, dataloader, save_path=None, map_labels=None):
-
-    # Get the latent space representations
+def plot_umap_latent_space(model, dataloader, save_path=None, map_labels=None, seed=42):
+    """
+    Plots UMAP projection of model latent space colored by labels.
+    
+    Args:
+        model: PyTorch model with return_latent=True support
+        dataloader: yields (eeg_lr, eeg_hr, pos, label)
+        save_path: Optional save path for figure
+        map_labels: Optional dict {int: str} for label mapping
+        seed: Random seed for reproducibility
+    """
+    # Collect all latent vectors and labels
     latent_vectors = []
     labels = []
-
+    
     model.eval()
     device = next(model.parameters()).device
-
-    for i, (eeg, eeg_hr, pos, label) in enumerate(dataloader):
+    
+    print("Extracting latent representations...")
+    for i, (eeg_lr, eeg_hr, pos, label) in enumerate(dataloader):
         print(f"Processing batch {i+1}/{len(dataloader)}", end='\r')
+        
+        eeg_lr = eeg_lr.to(device)
+        eeg_hr = eeg_hr.to(device) 
+        pos = pos.to(device)
+        label = label.to(device)  # In case needed
+        
         with torch.no_grad():
-            eeg = eeg.to(device)
-            eeg_hr = eeg_hr.to(device)
-            pos = pos.to(device)
             if model.__class__.__name__ == "DiBiMa_Diff":
-                batch_size = eeg.size(0)
-                t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, device=eeg.device, dtype=torch.long) # (B,)
+                batch_size = eeg_lr.size(0)
+                t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, 
+                             device=device, dtype=torch.long)
                 noise_hr = torch.randn_like(eeg_hr).to(device)
-                x_t_hr = model.scheduler.add_noise(eeg_hr, noise_hr, t).to(device)
-                latent_vector = model(x_t_hr, t, lr=eeg, pos=pos, return_latent=True)[-1]
+                x_t_hr = model.scheduler.add_noise(eeg_hr, noise_hr, t)
+                latent = model(x_t_hr, t, lr=eeg_lr, pos=pos, return_latent=True)[-1]
             else:
-                latent_vector = model(eeg, return_latent=True)[-1]
-            labels.extend(label.numpy())
-            del eeg, eeg_hr, pos
-            torch.cuda.empty_cache()
-            gc.collect()
+                latent = model(eeg_lr, return_latent=True)[-1]
+            
+            # Flatten to (B, D)
+            latent = latent.reshape(latent.size(0), -1).cpu().numpy()
+            latent_vectors.append(latent)
+            
+            # Collect labels per sample
+            for l in label.flatten():
+                labels.append(map_labels[l.item()] if map_labels else l.item())
         
-        latent_vector = latent_vector.reshape(latent_vector.size(0), -1)
-        latent_vectors.append(latent_vector.cpu().numpy())
+        # Memory management
+        del eeg_lr, eeg_hr, pos, label, latent
+        torch.cuda.empty_cache()
+        gc.collect()
     
-    latent_vectors = np.vstack(latent_vectors)
-
-    reducer = UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', random_state=seed).fit(latent_vectors)
-
-    plt.figure(figsize=(10, 8))
+    print("\nAggregating data...")
+    latent_vectors = np.vstack(latent_vectors)  # (N_total, D)
+    labels = np.array(labels)
+    
+    print(f"UMAP on {latent_vectors.shape[0]} samples, {latent_vectors.shape[1]} dims")
+    
+    # Fit UMAP ONCE on full dataset
+    reducer = UMAP(n_neighbors=15, min_dist=0.1, metric='euclidean', 
+                   random_state=seed, n_jobs=-1)
+    embedding = reducer.fit_transform(latent_vectors)
+    
+    # Plot by unique labels
+    plt.figure(figsize=(12, 8))
     u_labels = np.unique(labels)
+    
+    print("Generating scatter plot...")
     for ul in u_labels:
-        latent = [latent for i, latent in enumerate(latent_vectors) if labels[i] == ul]
-        latent = np.array(latent)
-        embedding = reducer.transform(latent)
-        if map_labels:
-            l = map_labels[ul]
-        else:
-            l = ul
-        plt.scatter(embedding[:, 0], embedding[:, 1], label=l, alpha=0.5)
+        mask = labels == ul
+        if np.sum(mask) > 0:
+            plt.scatter(embedding[mask, 0], embedding[mask, 1], 
+                       label=str(ul), alpha=0.6, s=20)
+            print(f"  {ul}: {np.sum(mask)} points")
     
-    plt.title('UMAP Projection of Latent Space')
-    plt.xlabel('UMAP 1')
-    plt.ylabel('UMAP 2')
-    plt.legend()
+    plt.title('UMAP Latent Space Projection', fontsize=14)
+    plt.xlabel('UMAP 1', fontsize=12)
+    plt.ylabel('UMAP 2', fontsize=12)
+    plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    plt.grid(True, alpha=0.3)
     plt.tight_layout()
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-
-def explain_super_resolution(model, eeg_lr, eeg_hr, channel_names, save_path=None):
-    """
-    Use saliency maps to explain which parts of the low-resolution EEG input
-    are most important for the super-resolution task.
-    """
-    model.eval()
-    eeg_lr.requires_grad_()
-
-    # Forward pass
-    output = model(eeg_lr)
-
-    # Compute loss (MSE between output and high-res target)
-    criterion = torch.nn.MSELoss()
-    loss = criterion(output, eeg_hr)
     
-    # Backward pass to compute gradients
-    loss.backward()
-
-    # Get saliency map (absolute value of gradients)
-    saliency = eeg_lr.grad.data.abs().squeeze().cpu().numpy()
-
-    # Plot saliency maps for each channel
-    num_channels = eeg_lr.shape[1]
-    _, axes = plt.subplots(num_channels, 1, figsize=(12, 2 * num_channels))
-    for i in range(num_channels):
-        axes[i].plot(saliency[i], color='red')
-        axes[i].set_title(f'Saliency Map - Channel: {channel_names[i]}')
-        axes[i].set_xlabel('Time')
-        axes[i].set_ylabel('Saliency')
-
-    plt.tight_layout()
     if save_path:
-        plt.savefig(save_path)
-        
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved: {save_path}")
+    
     plt.show()
+    plt.close()
+    print("UMAP visualization complete!")
+
 
 def tensor2raw(eeg_tensor, info):
     """
@@ -556,4 +628,3 @@ def generate_colors(n_colors: int = 1, method: str = 'hsv_uniform'):
             color = tuple(np.array(color) * np.array([1, sat, val]))
             colors.append(color)
         return colors
-    

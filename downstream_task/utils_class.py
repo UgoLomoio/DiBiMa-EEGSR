@@ -61,7 +61,7 @@ class EEGDatasetClassification(Dataset):
         self.datas, self.labels, self.positions, _ = download_eegbci_data(
             subject_ids, runs=self.runs, project_path=self.project_path,
             demo=self.demo,
-            dataset_name=self.dataset_name, verbose=self.verbose
+            dataset_name=self.dataset_name, verbose=self.verbose, is_classification=True
         )   
 
         self.ref_position = self.positions[0]  # Assuming all raws have same channel positions
@@ -157,7 +157,7 @@ class EEGDatasetClassification(Dataset):
         else:  # 'hr'
             data = hr_data
 
-        return data, label
+        return data.float(), label.long()
         
 def load_model_weights(model, model_path):
 

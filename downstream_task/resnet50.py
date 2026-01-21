@@ -67,46 +67,54 @@ class ResNet50(torch.nn.Module):
         )
 
     def forward(self,x):
+        x = x.to(self.parameters().__next__().device)
         x = self.features(x)
         x = x.view(-1,2048)
         x = self.classifer(x)
         return x
     
-
 class ResNetPL(pl.LightningModule):
 
-    def __init__(self, model, optimizer):
+    def __init__(self, model, optimizer, criterion):
         super(ResNetPL, self).__init__()
-        self.model = model
-        self.criterion = torch.nn.CrossEntropyLoss()
+        self.model = model.to(torch.float32)  # ALL params float32
+        self.model = self.model.float()
+        self.criterion = criterion
         self.optimizer = optimizer
         self.train_losses = []
         self.val_losses = []
         self.train_accs = []
         self.val_accs = []
-    
-    def forward(self, x):
-        return self.model(x)
+
+    def forward(self, x, return_embeddings=False):
+        x = x.to(self.device)
+        logits = self.model(x)
+        probs = torch.softmax(logits, dim=-1)   # multiclass
+        preds = torch.argmax(logits, dim=-1)
+        if return_embeddings:
+            embeddings = self.model.features(x)
+            embeddings = embeddings.view(embeddings.size(0), -1)
+            return logits, probs, preds, embeddings
+        else:
+            return logits, probs, preds  # tuple
 
     def training_step(self, batch, batch_idx):
         inputs, targets = batch
-        outputs = self(inputs)
-        targets = targets.long()
-        loss = self.criterion(outputs, targets)
-        self.train_losses.append(loss.item())
+        logits, probs, preds = self(inputs)
+        loss = self.criterion(logits, targets)
         self.log('train_loss', loss, prog_bar=True)
-        acc = (outputs.argmax(dim=1) == targets).float().mean()
-        self.train_accs.append(acc.item())
+        acc = (preds == targets).float().mean()
         self.log('train_acc', acc, prog_bar=True)
+        self.train_losses.append(loss.item())  # safe now
+        self.train_accs.append(acc.item())
         return loss
 
     def validation_step(self, batch, batch_idx):
         inputs, targets = batch
-        outputs = self(inputs)
-        targets = targets.long()
-        loss = self.criterion(outputs, targets)
+        logits, probs, preds = self(inputs)
+        loss = self.criterion(logits, targets)
+        acc = (preds == targets).float().mean()
         self.val_losses.append(loss.item())
-        acc = (outputs.argmax(dim=1) == targets).float().mean()
         self.val_accs.append(acc.item())
         return loss
     
@@ -121,15 +129,15 @@ class ResNetPL(pl.LightningModule):
         return super().on_validation_epoch_start()
     
     def on_train_epoch_end(self):
-        avg_train_loss = sum(self.train_losses) / len(self.train_losses)
-        avg_train_acc = sum(self.train_accs) / len(self.train_accs)
+        avg_train_loss = torch.mean(torch.tensor(self.train_losses))
+        avg_train_acc = torch.mean(torch.tensor(self.train_accs))
         self.log('avg_train_loss', avg_train_loss, prog_bar=True, on_epoch=True)
         self.log('avg_train_acc', avg_train_acc, prog_bar=True, on_epoch=True)
         return super().on_train_epoch_end()
     
     def on_validation_epoch_end(self):
-        avg_val_loss = sum(self.val_losses) / len(self.val_losses)
-        avg_val_acc = sum(self.val_accs) / len(self.val_accs)
+        avg_val_loss = torch.mean(torch.tensor(self.val_losses))
+        avg_val_acc = torch.mean(torch.tensor(self.val_accs))
         self.log('avg_val_acc', avg_val_acc, prog_bar=True, on_epoch=True)
         self.log('avg_val_loss', avg_val_loss, prog_bar=True, on_epoch=True)
         return super().on_validation_epoch_end()
@@ -140,10 +148,19 @@ class ResNetPL(pl.LightningModule):
 
     def predict(self, dataloader):
         self.eval()
-        all_outputs = []
+        all_logits = []
+        all_probs = []
+        all_preds = []
         with torch.no_grad():
             for batch in dataloader:
                 inputs, _ = batch
-                outputs = self(inputs)
-                all_outputs.append(outputs)
-        return torch.cat(all_outputs, dim=0)
+                inputs = inputs.float().to(self.device)
+                logits, probs, preds = self(inputs)
+                all_logits.append(logits.cpu())
+                all_probs.append(probs.cpu())
+                all_preds.append(preds.cpu())
+
+        all_logits = torch.cat(all_logits, dim=0)
+        all_probs = torch.cat(all_probs, dim=0)
+        all_preds = torch.cat(all_preds, dim=0)
+        return all_logits, all_probs, all_preds

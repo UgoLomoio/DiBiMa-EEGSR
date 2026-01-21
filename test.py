@@ -14,6 +14,7 @@ from utils import unmask_channels
 import gc 
 from torch.cuda import empty_cache
 import sys
+from utils import set_seed
 
 gc.collect()
 empty_cache()
@@ -34,7 +35,7 @@ nfolds = 4 # Number of folds for cross-validation
 
 torch.set_float32_matmul_precision('high')  # For better performance on GPUs with Tensor Cores
 
-demo = True # Set to True for a quick demo run
+demo = False # Set to True for a quick demo run
 debug = False  # Set to True to enable debug mode with additional logging
 
 if demo:
@@ -66,10 +67,22 @@ best_params = {
     "dim": 64, #64,  
     "d_state": 8, #16,  
     "n_mamba_blocks": 2, #5
-    "n_mamba_layers": 1,
+    "n_mamba_layers": 2, #1
     "use_mamba": True,
     "use_diffusion": True,
-    "use_electrode_embedding": True
+    "use_electrode_embedding": True,
+    'merge_type': 'add'  # 'concat' or 'add'
+}
+
+prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
+diffusion_params = {
+                    "num_train_timesteps": n_timesteps, #100,
+                    "beta_start": 1e-4,     #1e-5
+                    "beta_end": 1e-2,        #1e-2                                                                               
+                    "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
+                    "prediction_type": prediction_type,
+                    #"clip_sample": True,
+                    #"clip_sample_range": 1,
 }
 
 def load_model_weights(model, model_path):
@@ -91,20 +104,20 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
 
     if not quick_load:    
         
-        print("Downloading training data...")
-        dataset_train = EEGDataset(subject_ids=train_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
+        #print("Downloading training data...")
+        #dataset_train = EEGDataset(subject_ids=train_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
         print("Downloading testing data...")
         dataset_test = EEGDataset(subject_ids=test_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
 
-        if len(dataset_train) == 0:
-            print("No data loaded. Check dataset creation process.")
-            exit(1)
+        #if len(dataset_train) == 0:
+        #    print("No data loaded. Check dataset creation process.")
+        #    exit(1)
             
-        dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+        #dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
         dataloader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
         print("Train and Test datasets loaded successfully.")    
 
-        ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
+        #ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
     
     for name, model in models_nn.items():
         
@@ -114,16 +127,6 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
             models[name] = DiBiMa(model, learning_rate=learning_rate, loss_fn=loss_fn, debug=debug).to(device)
             models[name] = load_model_weights(models[name], os.path.join(models_path, f'fold_{fold+1}', f'DiBiMa_eeg_{name}_{fold+1}.pth'))
         else:
-            prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
-            diffusion_params = {
-                    "num_train_timesteps": n_timesteps, #100,
-                    "beta_start": 1e-5, 
-                    "beta_end": 1e-2,        #1e-3                                                                               
-                    "beta_schedule": "linear",
-                    "prediction_type": prediction_type,
-                    #"clip_sample": True,
-                    #"clip_sample_range": 1,
-            }
             models[name] = DiBiMa_Diff(model,
                                         loss_fn,
                                         diffusion_params=diffusion_params,
@@ -139,7 +142,7 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
     if quick_load:
         return models 
     else:       
-        return models, dataloader_train, dataloader_test
+        return models, dataloader_test
     
 
 def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, fold=0, multiplier = None, plot_one_example=True, ablation_type="Final"):
@@ -310,7 +313,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
         data_folder = data_path + os.sep + dataset_name
 
         dataloader_test = None  # Initialize dataloader_test
-        dataloader_train = None  # Initialize dataloader_train
+        #dataloader_train = None  # Initialize dataloader_train
 
         print("\n=== Training and Evaluating Models ===")
         for sr_type in sr_types:
@@ -319,7 +322,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
 
             for multiplier in multipliers:
                 print(f"\n### Fold {fold+1}, Multiplier: {multiplier} ###")
-                input_channels = target_channels if sr_type == "temporal" else int(target_channels // multiplier)
+                input_channels = target_channels if sr_type == "temporal" else math.ceil(target_channels / multiplier)
                 fs_hr = fs_hr
                 fs_lr = fs_hr // multiplier if sr_type == "temporal" else fs_hr
                 
@@ -334,7 +337,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
                         fs_lr=fs_lr,
                         fs_hr=fs_hr,
                         seconds=seconds,
-                        residual_global=True,
+                        residual_global=False,
                         residual_internal=True,
                         use_subpixel=True,
                         sr_type=sr_type,
@@ -347,13 +350,14 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
                         n_mamba_blocks=best_params["n_mamba_blocks"],
                         use_positional_encoding=False,
                         use_electrode_embedding=best_params["use_electrode_embedding"],  
+                        merge_type=best_params['merge_type']
                     )
-                    if dataloader_train is None or dataloader_test is None:
-                        models, dataloader_train, dataloader_test = prepare_dataloaders(
+                    if dataloader_test is None:
+                        models, dataloader_test = prepare_dataloaders(
                             dataset_name, models_nn, train_patients, test_patients,
                             data_folder, quick_load=False, ref_position=None
                         )
-                        ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
+                        ref_position = dataloader_test.dataset.ref_position.to(device)  # Reference electrode positions
                     else:
                         models = prepare_dataloaders(
                             dataset_name, models_nn, train_patients, test_patients,
@@ -373,8 +377,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
                             plot_umap_latent_space( 
                                                     model, 
                                                     dataloader_test,
-                                                    save_path=filepath,
-                                                    map_labels=map_runs_mmi
+                                                    save_path=filepath
                             )
                             print(f" Saved: {os.path.basename(filepath)}")                            
                             model.to('cpu')

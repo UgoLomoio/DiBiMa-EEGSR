@@ -8,27 +8,31 @@ from sklearn.preprocessing import label_binarize
 from itertools import cycle
 import warnings
 import torch
-from scipy.special import softmax
+
 warnings.filterwarnings('ignore')
+
+from sklearn.preprocessing import label_binarize
+from scipy.special import softmax
 
 def compute_metrics(y_true, y_pred, y_pred_proba=None, average='macro'):
     """
-    Compute metrics. Auto-converts tensors/raw preds to proper formats.
-    y_pred: logits/probs -> argmax to classes; y_pred_proba optional for ROC.
+    BINARY + MULTICLASS only. Handles tensors/logits→probs auto-conversion.
     """
-    # Convert tensors to numpy
-    if isinstance(y_true, torch.Tensor):
-        y_true = y_true.cpu().numpy()
-    if isinstance(y_pred, torch.Tensor):
-        y_pred = y_pred.cpu().numpy()
+    # Convert tensors
+    if isinstance(y_true, torch.Tensor): y_true = y_true.cpu().numpy()
+    if isinstance(y_pred, torch.Tensor): y_pred = y_pred.cpu().numpy()
     
-    # y_pred to classes if multioutput (shape >1D)
+    # Detect binary vs multiclass
+    n_unique = len(np.unique(y_true))
+    is_binary = (n_unique == 2)
+    n_classes = int(y_true.max() + 1) if not is_binary else 2
+    
+    # Predictions
     if len(y_pred.shape) > 1:
         y_pred_classes = np.argmax(y_pred, axis=-1)
     else:
         y_pred_classes = y_pred.astype(int)
     
-    # Ensure integers
     y_true = y_true.astype(int)
     
     metrics = {}
@@ -38,18 +42,22 @@ def compute_metrics(y_true, y_pred, y_pred_proba=None, average='macro'):
     metrics['recall'] = recall_score(y_true, y_pred_classes, average=average, zero_division=0)
     metrics['confusion_matrix'] = confusion_matrix(y_true, y_pred_classes)
     
-    # ROC-AUC: use provided or softmax y_pred
+    # ROC-AUC: logits → probs
     if y_pred_proba is None:
         if len(y_pred.shape) > 1:
-            y_pred_proba = softmax(y_pred, axis=-1) if y_pred.shape[1] > 1 else y_pred
-        else:
-            y_pred_proba = None
-    if y_pred_proba is not None:
-        try:
-            metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average=average)
-        except ValueError:
-            metrics['roc_auc'] = np.nan
+            y_pred_proba = softmax(y_pred, axis=-1)
+        else:  # binary single prob
+            y_pred_proba = y_pred
     
+    try:
+        if is_binary:
+            metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba[:, 1] if y_pred_proba.ndim > 1 else y_pred_proba)
+        else:
+            metrics['roc_auc'] = roc_auc_score(y_true, y_pred_proba, multi_class='ovr', average=average)
+    except ValueError:
+        metrics['roc_auc'] = np.nan
+    
+    metrics['is_binary'] = is_binary
     return metrics
 
 def plot_confusion_matrix(y_true, y_pred, dataset_name, class_names=None, figsize=(8, 6)):
@@ -71,54 +79,63 @@ def plot_confusion_matrix(y_true, y_pred, dataset_name, class_names=None, figsiz
     plt.tight_layout()
     plt.show()
 
-def plot_multiple_roc_curves(models_data, dataset_name, figsize=(10, 8)):
-    """
-    Plot multiple ROC curves for different models.
+def plot_multiple_roc_curves(models_data, dataset_name, figsize=(10, 8), input_type='probs', sr_type='lr'):
     
-    Parameters:
-    - models_data: dict {"model_name": {"y_trues": y_true, "y_preds": y_proba}}
-    - dataset_name: str 
-      Note: y_preds should be probabilities or scores (shape: n_samples, n_classes)
-    - figsize: tuple for figure size
-    """
-    plt.figure(figsize=figsize)
+    fig = plt.figure(figsize=figsize)
     colors = cycle(['aqua', 'darkorange', 'cornflowerblue', 'green', 'red', 'purple'])
+    
+    auc_results = {}
     
     for model_name, data in models_data.items():
         y_true = np.array(data['y_trues'])
-        y_scores = np.array(data['y_preds'])  # Probabilities/scores
+        y_scores = np.array(data['y_probs'] if 'y_probs' in data else data['y_logits'])
         
-        # Binarize y_true
-        n_classes = y_scores.shape[1]
-        y_onehot = label_binarize(y_true, classes=np.arange(n_classes))
+        # Logits → probs
+        if input_type == 'logits' or y_scores.max() > 1.0:
+            if y_scores.ndim == 1:  # binary (N,)
+                y_scores = np.stack([1-y_scores, y_scores], axis=1)
+            else:
+                from scipy.special import softmax
+                y_scores = softmax(y_scores, axis=1)
         
-        # Compute macro-average ROC
-        fpr, tpr, roc_auc = {}, {}, {}
-        for i in range(n_classes):
-            fpr[i], tpr[i], _ = roc_curve(y_onehot[:, i], y_scores[:, i])
-            roc_auc[i] = auc(fpr[i], tpr[i])
+        # Handle binary: ensure (N,2) or single positive class
+        if len(np.unique(y_true)) == 2:
+            if y_scores.shape[1] == 1:  # single positive logit/prob
+                y_scores = np.stack([1-y_scores, y_scores], axis=1)
+            pos_class = 1
+            fpr, tpr, _ = roc_curve(y_true, y_scores[:, pos_class])
+            roc_auc = auc(fpr, tpr)
+            color = next(colors)
+            plt.plot(fpr, tpr, color=color, linewidth=3,
+                    label=f'{model_name} (AUC={roc_auc:.3f})')
+        else:  # multiclass
+            n_classes = y_scores.shape[1]
+            classes = np.arange(n_classes)
+            y_onehot = label_binarize(y_true, classes=classes)
+            
+            fpr, tpr, roc_auc = {}, {}, {}
+            for i in range(n_classes):
+                fpr[i], tpr[i], _ = roc_curve(y_onehot[:, i], y_scores[:, i])
+                roc_auc[i] = auc(fpr[i], tpr[i])
+            
+            # Macro average
+            all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
+            mean_tpr = np.zeros_like(all_fpr)
+            for i in range(n_classes):
+                mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
+            mean_tpr /= n_classes
+            
+            color = next(colors)
+            plt.plot(all_fpr, mean_tpr, color=color, linewidth=3,
+                    label=f'{model_name} macro (AUC={auc(all_fpr, mean_tpr):.3f})')
         
-        # Macro average
-        all_fpr = np.unique(np.concatenate([fpr[i] for i in range(n_classes)]))
-        mean_tpr = np.zeros_like(all_fpr)
-        for i in range(n_classes):
-            mean_tpr += np.interp(all_fpr, fpr[i], tpr[i])
-        mean_tpr /= n_classes
-        fpr['macro'] = all_fpr
-        tpr['macro'] = mean_tpr
-        roc_auc['macro'] = auc(fpr['macro'], tpr['macro'])
-        
-        # Plot macro-average ROC
-        color = next(colors)
-        plt.plot(fpr['macro'], tpr['macro'], color=color, linewidth=2,
-                 label=f'{model_name} macro (AUC = {roc_auc["macro"]:.3f})')
+        auc_results[model_name] = roc_auc if 'roc_auc' in locals() else auc(all_fpr, mean_tpr)
     
     plt.plot([0, 1], [0, 1], 'k--', linewidth=2)
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title(f'ROC Curves (Macro-average) - {dataset_name}')
+    plt.xlim([0.0, 1.0]); plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate'); plt.ylabel('True Positive Rate')
+    plt.title(f'ROC Curves - {dataset_name}')
     plt.legend()
-    plt.tight_layout()
-    plt.show()
+    plt.grid(True, alpha=0.3); plt.tight_layout(); plt.show()
+    fig.savefig(f'roc_curves_{dataset_name}_{sr_type}_{input_type}.png')
+    return auc_results

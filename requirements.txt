@@ -18,6 +18,9 @@ diffusers
 causal-conv1d>=1.4.0
 lmdb
 
+grad-cam
+captum 
+
 einops==0.8.0
 torchvision==0.24.0
 timm==1.0.3

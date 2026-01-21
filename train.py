@@ -29,7 +29,7 @@ device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 # Hyperparameters
 batch_size = 32
-epochs = 1
+epochs = 100
 learning_rate = 0.001 #0.001
 seeds = 2
 seconds = 10 #2 #9760 samples /160 Hz = 61 seconds
@@ -38,7 +38,7 @@ nfolds = 4 # Number of folds for cross-validation
 
 torch.set_float32_matmul_precision('high')  # For better performance on GPUs with Tensor Cores
 
-demo = True # Set to True for a quick demo run
+demo = False # Set to True for a quick demo run
 debug = False  # Set to True to enable debug mode with additional logging
 
 if demo:
@@ -74,10 +74,11 @@ best_params = {
     "dim": 64, #64,  
     "d_state": 8, #16,  
     "n_mamba_blocks": 2, #5
-    "n_mamba_layers": 1,
+    "n_mamba_layers": 2, #1
     "use_mamba": True,
     "use_diffusion": True,
-    "use_electrode_embedding": True
+    "use_electrode_embedding": True,
+    'merge_type': 'add'  # 'concat' or 'add'
 }
 
 
@@ -116,9 +117,9 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
             prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
             diffusion_params = {
                     "num_train_timesteps": n_timesteps, #100,
-                    "beta_start": 1e-5, 
-                    "beta_end": 1e-2,        #1e-3                                                                               
-                    "beta_schedule": "linear",
+                    "beta_start": 1e-4,     #1e-5
+                    "beta_end": 1e-2,        #1e-2                                                                               
+                    "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
                     "prediction_type": prediction_type,
                     #"clip_sample": True,
                     #"clip_sample_range": 1,
@@ -131,7 +132,7 @@ def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, 
                                         predict_type=prediction_type,  # "epsilon" or "sample"
                                         debug=debug,
                                         epochs=epochs,
-                                        plot=True).to(device)
+                                        plot=False).to(device)
 
     if quick_load:
         return models 
@@ -342,7 +343,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
 
             for multiplier in multipliers:
                 print(f"\n### Fold {fold+1}, Multiplier: {multiplier} ###")
-                input_channels = target_channels if sr_type == "temporal" else int(target_channels // multiplier)
+                input_channels = target_channels if sr_type == "temporal" else math.ceil(target_channels / multiplier)
                 fs_hr = fs_hr
                 fs_lr = fs_hr // multiplier if sr_type == "temporal" else fs_hr
                 
@@ -361,7 +362,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
                         fs_lr=fs_lr,
                         fs_hr=fs_hr,
                         seconds=seconds,
-                        residual_global=True,
+                        residual_global=False,
                         residual_internal=True,
                         use_subpixel=True,
                         sr_type=sr_type,
@@ -374,6 +375,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
                         n_mamba_blocks=best_params["n_mamba_blocks"],
                         use_positional_encoding=False,
                         use_electrode_embedding=best_params["use_electrode_embedding"],  
+                        merge_type=best_params['merge_type']
                     )
                     if dataloader_train is None or dataloader_test is None:
                         models, dataloader_train, dataloader_test = prepare_dataloaders(

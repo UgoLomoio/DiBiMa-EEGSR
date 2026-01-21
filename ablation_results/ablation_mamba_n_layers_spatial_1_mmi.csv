@@ -1,2 +1,0 @@
-,MSE,RMSE,PSNR,SSIM,NMSE,PCC,SNR,Avg Inference Time,Parameters
-8to64chs_spatial_mamba1_nb3_d128_ds32_nl1,0.015338 ± 0.004,0.122856 ± 0.016,18.2805 ± 1.084,0.1234 ± 0.040,0.504812 ± 0.193,0.6775 ± 0.164,3.9958 ± 1.625,0.004084 ± 0.000,1.0M

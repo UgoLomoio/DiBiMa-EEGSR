@@ -183,7 +183,8 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
                 t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, device=hr_target.device, dtype=torch.long) # (B,)
                 # Diffuse HR
                 noise_hr = torch.randn_like(hr_target)
-                x_t_hr = model.scheduler.add_noise(hr_target, noise_hr, t)
+                #x_t_hr = model.scheduler.add_noise(hr_target, noise_hr, t)
+                x_t_hr = noise_hr  # Start from pure noise
                 # Model prediction (same signature as training)
                 sr_recon = model(x_t_hr, t, lr_input, pos)  # (B, C_HR, L')
 
