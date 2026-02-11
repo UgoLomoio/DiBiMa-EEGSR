@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import numpy as np
 from scipy.stats import pearsonr
-from models import DiBiMa_Diff
 import torch.nn.functional as F
 
 """1D Signal Quality Metrics"""
@@ -36,6 +35,14 @@ def snr2d(original, reconstructed):
     if original.shape != reconstructed.shape:
         raise ValueError(f"Shapes mismatch: {original.shape} vs {reconstructed.shape}")
     
+    if original.ndim == 1 and reconstructed.ndim == 1: #signal are flattened       
+
+        signal_power = torch.mean(original ** 2)
+        noise_power = torch.mean((reconstructed - original) ** 2)
+        noise_power = torch.clamp(noise_power, min=1e-8)
+        mean_snr = 10 * torch.log10(signal_power / noise_power)
+        return mean_snr.item()
+    
     # Compute per-batch-per-channel: mean across L (dim=2)
     signal_power = torch.mean(original ** 2, dim=2)  # [B, C]
     noise_power = torch.mean((reconstructed - original) ** 2, dim=2)  # [B, C]
@@ -57,6 +64,21 @@ def ssim2d(original, reconstructed):
     if original.shape != reconstructed.shape:
         raise ValueError(f"Shapes mismatch: {original.shape} vs {reconstructed.shape}")
     
+    if original.ndim == 1 and reconstructed.ndim == 1:  #signal are flattened
+        #compute ssim 1d
+        mu1 = torch.mean(original)
+        mu2 = torch.mean(reconstructed)
+        sigma1_sq = torch.var(original)
+        sigma2_sq = torch.var(reconstructed)
+        centered1 = original - mu1
+        centered2 = reconstructed - mu2
+        sigma12 = torch.mean(centered1 * centered2) 
+        C1, C2 = 0.01**2, 0.03**2
+        num = (2 * mu1 * mu2 + C1) * (2 * sigma12 + C2)
+        den = (mu1**2 + mu2**2 + C1) * (sigma1_sq + sigma2_sq + C2)
+        ssim = num / den
+        return ssim.cpu().item()
+
     B, C, L = original.shape
     mu1 = torch.mean(original, dim=2)  # [B, C]
     mu2 = torch.mean(reconstructed, dim=2)  # [B, C]
@@ -82,6 +104,10 @@ def pcc2d(x, y):
     if x.shape != y.shape:
         raise ValueError(f"Shapes mismatch: {x.shape} vs {y.shape}")
     
+    if x.ndim == 1 and y.ndim == 1:  #signal are flattened
+        r, _ = pearsonr(x.cpu().detach().numpy(), y.cpu().detach().numpy())
+        return r
+    
     x_np = x.cpu().detach().numpy()
     y_np = y.cpu().detach().numpy()
     r2s = []
@@ -99,6 +125,19 @@ def pcc2d_torch(x, y):
     if x.shape != y.shape:
         raise ValueError(f"Shapes mismatch: {x.shape} vs {y.shape}")
     
+    if x.ndim == 1 and y.ndim == 1:  #signal are flattened
+        x_mu = x.mean()
+        y_mu = y.mean()
+        x_c = x - x_mu
+        y_c = y - y_mu
+        cov = (x_c * y_c).mean()
+        std_x = x_c.pow(2).mean().sqrt()
+        std_y = y_c.pow(2).mean().sqrt()
+        std_x = torch.clamp(std_x, min=1e-8)
+        std_y = torch.clamp(std_y, min=1e-8)
+        pcc = cov / (std_x * std_y)
+        return pcc.item()
+
     # Center: [B,C,L]
     x_mu = x.mean(dim=-1, keepdim=True)
     y_mu = y.mean(dim=-1, keepdim=True)
@@ -117,21 +156,6 @@ def pcc2d_torch(x, y):
     pcc = cov / (std_x * std_y)  # [B,C]
     return pcc.mean().item()
 
-def nmse2d_real(original, reconstructed):
-    """
-    NMSE for real-valued signals: ||reconstructed - original||^2 / ||original||^2
-    Averaged over batch and channels.
-    Lower is better (0=perfect).
-    """
-    if original.shape != reconstructed.shape:
-        raise ValueError(f"Shapes mismatch: {original.shape} vs {reconstructed.shape}")
-    
-    mse = torch.mean((reconstructed - original) ** 2, dim=2)  # [B, C]
-    power_orig = torch.mean(original ** 2, dim=2)  # [B, C]
-    power_orig = torch.clamp(power_orig, min=1e-8)
-    nmse = mse / power_orig
-    return torch.mean(nmse).item()
-
 def nmse2d(original, reconstructed):
     """
     Standard NMSE: MSE / var(original) per-channel per-batch.
@@ -140,6 +164,13 @@ def nmse2d(original, reconstructed):
     if original.shape != reconstructed.shape:
         raise ValueError(f"Shapes mismatch: {original.shape} vs {reconstructed.shape}")
     
+    if original.ndim == 1 and reconstructed.ndim == 1:  #signal are flattened
+        mse = torch.mean((reconstructed - original) ** 2)
+        var_orig = torch.var(original)
+        var_orig = torch.clamp(var_orig, min=1e-8)
+        nmse = mse / var_orig
+        return nmse.item()
+
     mse = torch.mean((reconstructed - original) ** 2, dim=2)  # [B, C]
     var_orig = torch.var(original, dim=2)  # [B, C] - signal power
     var_orig = torch.clamp(var_orig, min=1e-8)
@@ -147,7 +178,7 @@ def nmse2d(original, reconstructed):
     return torch.mean(nmse).item()
 
 # Evaluation
-def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
+def evaluate_model(model, dataloader, sample_type="noise", evaluate_mean=False, flatten = True):
 
     #evaluate_mean: if True, evaluate the mean signal as baseline
     model.eval()
@@ -166,10 +197,12 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
 
     print("Evaluating model performances...")
     with torch.no_grad():
-        for lr_input, hr_target, pos, _ in tqdm(dataloader, desc="Test", unit="seg", leave=False):
+        for batch_idx, (lr_input, hr_target, pos, label) in enumerate(tqdm(dataloader, desc="Test", unit="seg", leave=False)):
             lr_input = lr_input.to(device)
             hr_target = hr_target.to(device)
             pos = pos.to(device)
+            label = label.to(device)
+
             if model.model.use_electrode_embedding:
                 pos = pos.float()
             else:
@@ -179,15 +212,17 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
             start = time.time()
             if model.model.use_diffusion:
                 
-                batch_size = lr_input.size(0)
-                t = torch.full((batch_size,), model.scheduler.num_train_timesteps - 1, device=hr_target.device, dtype=torch.long) # (B,)
-                # Diffuse HR
-                noise_hr = torch.randn_like(hr_target)
-                #x_t_hr = model.scheduler.add_noise(hr_target, noise_hr, t)
-                x_t_hr = noise_hr  # Start from pure noise
-                # Model prediction (same signature as training)
-                sr_recon = model(x_t_hr, t, lr_input, pos)  # (B, C_HR, L')
-
+                #print("Using diffusion model for inference...")
+                if sample_type == "noise":
+                    sr_recon = model.sample(lr_input, pos=pos, label=label)
+                else:
+                    #if model.model.use_lr_conditioning:
+                        #print("Using LR conditioning for inference...")
+                    sr_recon = model.sample_from_lr(lr_input, pos=pos, label=label)
+                    #else:
+                        #print("Not using LR conditioning for inference...")
+                    #    sr_recon = model.sample(lr_input, pos=pos, label=label)
+                
             else:
                 #print("Using standard model for inference...")
                 sr_recon = model(lr_input)
@@ -199,21 +234,26 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
                 # 1-channel mean signal as baseline
                 sr_recon = sr_recon.mean(dim=1, keepdim=True)
                 hr_target = hr_target.mean(dim=1, keepdim=True)
+            else:
+                if flatten:
+                    # Flatten channels and batch
+                    sr_recon = sr_recon.flatten()
+                    hr_target = hr_target.flatten()
 
             mse = mse_crit(sr_recon, hr_target).item()
             mses.append(mse)
             rmse = np.sqrt(mse)
             rmses.append(rmse)
 
-            snr = snr2d(sr_recon, hr_target)
+            snr = snr2d(hr_target, sr_recon)
             #print(f'SNR: {snr:.4f}')
-            ssim = ssim2d(sr_recon, hr_target)
+            ssim = ssim2d(hr_target, sr_recon)
             #print(f'SSIM: {ssim:.4f}')
-            nmse = nmse2d_real(sr_recon, hr_target)
+            nmse = nmse2d(hr_target, sr_recon)
             #print(f'NMSE: {nmse:.6f}')
-            pcc = pcc2d_torch(sr_recon, hr_target)
+            pcc = pcc2d_torch(hr_target, sr_recon)
             #print(f'PCC: {pcc:.4f}')
-            psnr = psnr2d(sr_recon, hr_target)
+            psnr = psnr2d(hr_target, sr_recon)
             #print(f'PSNR: {psnr:.4f}')
                 
             ssims.append(ssim)
@@ -239,7 +279,7 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
     rmse_std = np.std(rmses)
     psnr_std = np.std(psnrs)
     ssim_std = np.std(ssims)
-    nmse_std = np.std(nmses)
+    nmse_std = np.std(nmses)    
     pcc_std = np.std(ppcs)
     snr_std = np.std(snrs)
     inf_time_std = np.std(inf_times)      
@@ -262,46 +302,80 @@ def evaluate_model(model, dataloader, n_timesteps=None, evaluate_mean=False):
         'SSIM': ssims,
         'NMSE': nmses,
         'PCC': ppcs,
-        'SNR': snrs
+        'SNR': snrs,
     }
     return dict, dict_raw
 
 import matplotlib.pyplot as plt
 
-def plot_metric_boxplots(metrics_dict, figsize=(12, 6), name = 'metrics_boxplots', project_path='.'):
+def plot_metric_barplots(metrics_dict, name='metrics_barplots', project_path='.'):
     """
-    Plot boxplots for evaluation metrics.
-
+    Plot grouped bar plots with error bars for evaluation metrics.
+    Creates two separate figures: one for PSNR/SNR and one for other metrics.
+    
     Args:
-        metrics_dict: dict of metric names (keys) and their raw value lists (values).
-                      Each value should be a list (not a mean±std string).
-        figsize: size of the matplotlib figure.
+        metrics_dict: dict of model names (keys) and their metrics dict (values).
+                      Structure: {model_name: {metric_name: [values]}}
+        name: base name for saved figures.
+        project_path: path to save the figures.
     """
-
-    data = {}
-
-    # Only include metrics that are lists/numpy arrays (not strings)
-    for model_name, values in metrics_dict.items():
-        if model_name not in data:
-            data[model_name] = {}
-
-        for metric_name, metric_values in values.items():
-            if metric_name not in data[model_name]:
-                data[model_name][metric_name] = []
-            data[model_name][metric_name] = metric_values
-
-    for metric_name in data[list(data.keys())[0]].keys():
-        model_names = list(data.keys())
-        data_to_plot = [data[model][metric_name] for model in model_names]
-        fig = plt.figure(figsize=figsize)
-        plt.boxplot(data_to_plot, labels=model_names)
-        plt.ylabel(metric_name)
-        plt.title('Models Performance Metrics Boxplots')
-        plt.xticks(rotation=45)
-        #plt.tight_layout()
-        fig.savefig(f'{project_path}/{name}_{metric_name}_boxplots.png')
-        plt.close(fig)  #Close figure to free memory
-        #plt.show()
+    
+    import numpy as np
+    
+    model_names = list(metrics_dict.keys())
+    all_metrics = list(next(iter(metrics_dict.values())).keys())
+    
+    # Separate metrics into two groups
+    signal_metrics = [m for m in all_metrics if m.upper() in ['PSNR', 'SNR']]
+    other_metrics = [m for m in all_metrics if m.upper() not in ['PSNR', 'SNR']]
+    
+    # Calculate means and stds
+    means = {model: {metric: np.mean(metrics_dict[model][metric]) 
+                     for metric in all_metrics} for model in model_names}
+    stds = {model: {metric: np.std(metrics_dict[model][metric]) 
+                    for metric in all_metrics} for model in model_names}
+    
+    # Function to create a bar plot for a group of metrics
+    def create_barplot(metrics_list, title, filename_suffix, color_palette=None):
+        if not metrics_list:
+            return
+        
+        x = np.arange(len(metrics_list))
+        width = 0.8 / len(model_names)
+        
+        fig, ax = plt.subplots(figsize=(max(8, len(metrics_list) * 2), 6))
+        
+        # Default color palette if not provided
+        if color_palette is None:
+            color_palette = plt.cm.Set2(np.linspace(0, 1, len(model_names)))
+        
+        for idx, model in enumerate(model_names):
+            offset = width * idx - (width * len(model_names) / 2 - width / 2)
+            mean_values = [means[model][metric] for metric in metrics_list]
+            std_values = [stds[model][metric] for metric in metrics_list]
+            
+            ax.bar(x + offset, mean_values, width, label=model, 
+                   yerr=std_values, capsize=5, alpha=0.8, color=color_palette[idx])
+        
+        ax.set_xlabel('Metrics', fontweight='bold', fontsize=12)
+        ax.set_ylabel('Value', fontweight='bold', fontsize=12)
+        ax.set_title(title, fontweight='bold', fontsize=14)
+        ax.set_xticks(x)
+        ax.set_xticklabels(metrics_list, rotation=45, ha='right', fontsize=11)
+        ax.legend(loc='best', fontsize=10)
+        ax.grid(axis='y', alpha=0.3, linestyle='--')
+        
+        plt.tight_layout()
+        save_path = f'{project_path}/{name}_{filename_suffix}.png'
+        fig.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close(fig)
+        print(f"Figure saved to: {save_path}")
+    
+    # Create figures
+    create_barplot(signal_metrics, 'Signal Quality Metrics (PSNR & SNR)', 
+                   'signal_metrics', plt.cm.Reds(np.linspace(0.4, 0.8, len(model_names))))
+    create_barplot(other_metrics, 'Other Performance Metrics', 
+                   'other_metrics', plt.cm.Blues(np.linspace(0.4, 0.8, len(model_names))))
 
 
 if __name__ == "__main__":
@@ -326,6 +400,5 @@ if __name__ == "__main__":
     print("SNR:", snr2d(original, reconstructed))
     print("SSIM:", ssim2d(original, reconstructed))
     print("NMSE:", nmse2d(original, reconstructed))
-    print("NMSE (real):", nmse2d_real(original, reconstructed))
     print("PCC:", pcc2d(original, reconstructed))
     print("PCC (torch):", pcc2d_torch(original, reconstructed))

@@ -1,18 +1,16 @@
-import diffusers
+from diffusers import DDPMScheduler, DDIMScheduler
 import torch
 from torch import nn
 from models import *
 from utils import *
 import os 
 from metrics import *
-from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader
 import pandas as pd
 from tabulate import tabulate
 import mne
 from pytorch_lightning import Trainer
 import torchinfo 
-from visualize import plot_mean_timeseries
 from utils import unmask_channels
 import gc 
 from torch.cuda import empty_cache
@@ -27,20 +25,48 @@ project_path = os.getcwd()
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+#Diffusion scheduler
+prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
+n_timesteps = 1000 # Number of diffusion timesteps
+diffusion_params = {
+                "num_train_timesteps": n_timesteps, #100,
+                "beta_start": 1e-4,
+                "beta_end": 0.015,                                                                          
+                "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
+                "prediction_type": prediction_type,
+}
+train_scheduler = DDPMScheduler(
+    num_train_timesteps=diffusion_params["num_train_timesteps"],
+    beta_start=diffusion_params["beta_start"],
+    beta_end=diffusion_params["beta_end"],
+    beta_schedule=diffusion_params["beta_schedule"],
+    prediction_type=diffusion_params["prediction_type"],
+)
+
+val_scheduler = DDIMScheduler(
+    num_train_timesteps=diffusion_params["num_train_timesteps"],
+    beta_start=diffusion_params["beta_start"],
+    beta_end=diffusion_params["beta_end"],
+    beta_schedule=diffusion_params["beta_schedule"],
+    prediction_type=diffusion_params["prediction_type"]
+)
+val_scheduler.eta = 0 
+
 # Hyperparameters
 batch_size = 32
 epochs = 30
-learning_rate = 0.001 #0.001
+learning_rate = 0.01 #0.001
 seed = 2
-seconds = 10 #2 #9760 samples /160 Hz = 61 seconds
+seconds = 2 #2 #9760 samples /160 Hz = 61 seconds
 set_seed(seed)
 
 nfolds = 1 # Number of folds for cross-validation
 
 torch.set_float32_matmul_precision('high')  # For better performance on GPUs with Tensor Cores
 
-demo = False # Set to True for a quick demo run
+demo = True # Set to True for a quick demo run
 debug = False  # Set to True to enable debug mode with additional logging
+split_windows_first  = True  # Whether to split data into windows before splitting into train/val/test
 
 if demo:
     print("Demo mode activated: Using smaller dataset and fewer epochs for quick testing.")
@@ -52,7 +78,6 @@ dict_n_patients = {
     "mmi": 109,
     "seed": 15
 }
-n_patients = dict_n_patients["mmi"]  # Number of patients in the dataset   
 
 models_path = project_path + os.sep + "model_weights"
 data_path = project_path + os.sep + "eeg_data"
@@ -64,14 +89,21 @@ if not os.path.exists(imgs_path):
 if not os.path.exists(ablations_path):
     os.makedirs(ablations_path)
 
+sr_types = ["temporal"]  # Types of super-resolution to evaluate
+
+loss_fn = EEGSuperResolutionLoss(
+    lambda_grad=0.5,      # Start with equal weight to MSE
+    lambda_corr=0.2,      # Moderate correlation enforcement
+    lambda_freq=0.5,      # Lower weight for frequency
+    use_freq_loss=True
+)      
 loss_fn = nn.MSELoss() #nn.MSELoss() #ReconstructionLoss()  # Loss function: callable function
 
-sr_types = ["spatial", "temporal"]  # Types of super-resolution to evaluate
-
-n_mamba_blocks = [1, 3, 5]  # Number of Mamba blocks in each Bi-Mamba layer
+validate_only = True  # If True, only validate pre-trained models without training
+n_mamba_blocks = [1, 2, 3]  # Number of Mamba blocks in each Bi-Mamba layer
 mamba_versions = [1, 2]  # Mamba version to use (1 or 2), 3 is not implemented yet but exists
 mamba_dims = [32, 64, 128]  # Mamba dimension (number of channels in Mamba layer)
-mamba_d_state = [8, 16, 32] # Mamba state dimension (number of channels in Mamba state)
+mamba_d_state = [8, 16] # Mamba state dimension (number of channels in Mamba state)
 n_mamba_layers = [1, 2]  # Number of Bi-Mamba layers in the model
 mamba_presence = [True, False]  # Whether to include Mamba layers or not
 diffusion_presence = [True, False]  # Whether to include Diffusion or not
@@ -79,14 +111,17 @@ diffusion_presence = [True, False]  # Whether to include Diffusion or not
 n_timesteps = 1000  # Number of diffusion timesteps
 
 best_params = {
-    "version": 2,
-    "dim": 64, #64,  
-    "d_state": 8, #16,  
+    "mamba_version": 2,
+    "mamba_dim": 64, #128, 
+    "mamba_d_state": 16, #8,  
     "n_mamba_blocks": 2, #5
     "n_mamba_layers": 2, #1
     "use_mamba": True,
-    "use_diffusion": True,
-    "use_electrode_embedding": True,
+    "use_diffusion": False,
+    "use_electrode_embedding": False,
+    "internal_residual": False,
+    "use_label": False,
+    "use_lr_conditioning": False,
     'merge_type': 'add'  # 'concat' or 'add'
 }
 best_params = None  # Set to None to perform full HPO
@@ -94,63 +129,65 @@ best_params = None  # Set to None to perform full HPO
 if best_params is not None:
     epochs = 20  # Increase epochs if using best params directly
 
-def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, data_folder, quick_load=True, ref_position=None):
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    models = {}
+def prepare_dataloaders_patients(dataset_name, train_patients, val_patients, data_folder, seconds = 2, quick_load=True, ref_position=None):
 
     num_channels = 64 if dataset_name == "mmi" else 62
 
-    if not quick_load:    
-        
-        print("Downloading training data...")
-        dataset_train = EEGDataset(subject_ids=train_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
-        print("Downloading testing data...")
-        dataset_test = EEGDataset(subject_ids=test_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
+    print("Downloading training data...")
+    dataset_train = EEGDataset(subject_ids=train_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels, seconds=seconds)
+    print("Downloading testing data...")
+    dataset_val = EEGDataset(subject_ids=val_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels, seconds=seconds)
 
-        if len(dataset_train) == 0:
-            print("No data loaded. Check dataset creation process.")
-            exit(1)
+    if len(dataset_train) == 0:
+        print("No data loaded. Check dataset creation process.")
+        exit(1)
             
-        dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
-        dataloader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
-        print("Train and Test datasets loaded successfully.")    
-
-        ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
+    dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+    dataloader_val = DataLoader(dataset_val, batch_size=batch_size, shuffle=False)
+    print("Train and val datasets loaded successfully.")    
     
-    for name, model in models_nn.items():
+    return dataloader_train, dataloader_val
+
+def prepare_dataloaders_windows(dataset_name, dataset, batch_size=32, return_test=False):
+
+    num_channels = 64 if dataset_name == "mmi" else 62
+
+    windows = dataset.datas_hr
+    positions = dataset.positions
+    labels = dataset.labels
+    channel_names = dataset.channel_names
+
+    if return_test:
+        (train_windows, train_labels, train_positions), (val_windows, val_labels, val_positions), (test_windows, test_labels, test_positions) = train_test_val_split(windows, labels, positions, test_size=0.2, val_size=0.1, random_state=seed)
+    else:
+        (train_windows, train_labels, train_positions), (val_windows, val_labels, val_positions), _ = train_test_val_split(windows, labels, positions, test_size=0.2, val_size=0.1, random_state=seed)
+    
+    print("Creating training and val datasets from windows...")
+    dataset_train = EEGWindowsDataset(windows=train_windows, positions=train_positions,
+                                     labels=train_labels, channel_names=channel_names, dataset_name=dataset_name,
+                                     target_channels=num_channels, fs_hr=dataset.fs_hr,
+                                     multiplier=dataset.multiplier)
+    dataset_val = EEGWindowsDataset(windows=val_windows, positions=val_positions,
+                                    labels=val_labels, channel_names=channel_names, dataset_name=dataset_name,
+                                    target_channels=num_channels, fs_hr=dataset.fs_hr,
+                                    multiplier=dataset.multiplier)
+    if return_test:
+        dataset_test = EEGWindowsDataset(windows=test_windows, positions=test_positions,
+                                        labels=test_labels, channel_names=channel_names, dataset_name=dataset_name,
+                                        target_channels=num_channels, fs_hr=dataset.fs_hr,
+                                        multiplier=dataset.multiplier)
         
-        model.ref_position = ref_position  # Set reference positions in the model
-
-        if model.use_diffusion == False:
-            models[name] = DiBiMa(model, learning_rate=learning_rate, loss_fn=loss_fn, debug=debug).to(device)
-        else:
-            prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
-            diffusion_params = {
-                    "num_train_timesteps": n_timesteps, #100,
-                    "beta_start": 1e-4,     #1e-5
-                    "beta_end": 1e-2,        #1e-2                                                                               
-                    "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
-                    "prediction_type": prediction_type,
-                    #"clip_sample": True,
-                    #"clip_sample_range": 1,
-            }
-            models[name] = DiBiMa_Diff(model,
-                                        loss_fn,
-                                        diffusion_params=diffusion_params,
-                                        learning_rate=learning_rate,
-                                        scheduler_params=None,
-                                        predict_type=prediction_type,  # "epsilon" or "sample"
-                                        debug=debug,
-                                        epochs=epochs,
-                                        plot=False).to(device)
-
-    if quick_load:
-        return models 
-    else:       
-        return models, dataloader_train, dataloader_test
-
+    print("Preparing training and val dataloaders from windows...")
+    dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
+    dataloader_val = DataLoader(dataset_val, batch_size=batch_size, shuffle=False)
+    if return_test:
+        dataloader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
+        print("Train, Val and Test dataloaders prepared successfully.")    
+        return dataloader_train, dataloader_val, dataloader_test
+  
+    print("Train and Val dataloaders prepared successfully.")    
+    return dataloader_train, dataloader_val
 
 def select_best_model(results, configs, metric_key="NMSE", selected_name=""):
     if metric_key in ["MSE", "NMSE", "MAE"]:
@@ -164,8 +201,8 @@ def select_best_model(results, configs, metric_key="NMSE", selected_name=""):
     best_results = results[best_model_name]
     return best_param, best_config, best_results
 
-def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patients, data_folder,
-                        fs_lr=20, seconds=10, fs_hr=160, target_channels=64, input_channels=16,
+def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patients, val_patients, data_folder,
+                        fs_lr=20, seconds=2, fs_hr=160, target_channels=64, input_channels=16,
                         mamba_versions=[1, 2], mamba_dims=[64,128,256], mamba_d_state=[16,64], 
                         n_mamba_layers=[1], n_mamba_blocks=[1, 2, 3], metric_key="NMSE", multiplier = 8):
     """
@@ -175,12 +212,12 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     """
     if sr_type == "spatial":
         fs_lr = fs_hr #temporal resolution is not changed in spatial SR
-        sr_nam = f"{input_channels}to64chs_{sr_type}"
+        sr_nam = f"{input_channels}to{target_channels}chs_{sr_type}"
     elif sr_type == "temporal":
         input_channels = target_channels #all channels are used for temporal SR
         sr_nam = f"x{multiplier}_{sr_type}"
 
-    def run_search(configs, fs_hr, fs_lr, target_channels, input_channels, ablation_type="", dataloader_train=None, dataloader_test=None, multiplier=8):
+    def run_search(configs, fs_hr, fs_lr, target_channels, input_channels, ablation_type="", dataloader_train=None, dataloader_val=None, multiplier=8):
         
         clear_memory()
         models_nn = {}
@@ -191,11 +228,12 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
                 fs_lr=fs_lr,
                 fs_hr=fs_hr,
                 seconds=seconds,
-                residual_global=False,
+                dataset_name=dataset_name,
+                multiplier=multiplier,
+                residual_global=True,
                 residual_internal=True,
                 use_subpixel=True,
                 use_positional_encoding=False,
-                use_electrode_embedding=False, #changing to True in the final ablation
                 sr_type=sr_type,
                 use_diffusion=bool(cfg["use_diffusion"]),
                 use_mamba=bool(cfg["use_mamba"]),
@@ -204,35 +242,61 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
                 mamba_dim=int(cfg["mamba_dim"]),
                 mamba_d_state=int(cfg["mamba_d_state"]),
                 mamba_version=int(cfg["mamba_version"]),
+                use_label=False,
+                use_lr_conditioning=True if cfg.get("use_diffusion", True) else False,
+                use_electrode_embedding=True if cfg.get("use_diffusion", True) else False,
                 merge_type='add'  # 'concat' or 'add'
-        )        
-        if (dataloader_train is not None) and (dataloader_test is not None):
-            quick_load = True
-            ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
-            models = prepare_dataloaders(
-                dataset_name, models_nn, train_patients, test_patients,
-                data_folder, quick_load=quick_load, ref_position=ref_position
+        )
+        quick_load = True
+        if dataloader_train is None and dataloader_val is None:  
+            quick_load = False     
+            if split_windows_first:
+                dataset = EEGDataset(subject_ids=train_patients + test_patients + val_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=target_channels, seconds=seconds)
+                dataloader_train, dataloader_val = prepare_dataloaders_windows(
+                    dataset_name, dataset, batch_size=batch_size
+                )
+                del dataset
+            else:
+                dataloader_train, dataloader_val = prepare_dataloaders_patients(
+                    dataset_name, train_patients, val_patients,
+                    data_folder, seconds=seconds, quick_load=quick_load, ref_position=None
             )
-        else:
-            quick_load = False
-            models, dataloader_train, dataloader_test = prepare_dataloaders(
-                dataset_name, models_nn, train_patients, test_patients,
-                data_folder, quick_load=quick_load, ref_position=None
-            )
-        _, results = train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, multiplier=multiplier, ablation_type=ablation_type)
-
+            
+        models = {}
+        for name, model in models_nn.items():
+            if model.use_diffusion:
+                models[name] = DiBiMa_Diff(model,
+                                            train_scheduler=train_scheduler,
+                                            val_scheduler=val_scheduler,
+                                            criterion=loss_fn,
+                                            learning_rate=learning_rate,
+                                            debug=debug,
+                                            predict_type=prediction_type,
+                                            epochs=epochs,
+                                            plot=False).to(device)
+            else:
+                models[name] = DiBiMa(model,
+                                        loss_fn=loss_fn,
+                                        learning_rate=learning_rate,
+                                        debug=debug,
+                                        plot=False).to(device)
+                
+        _, results = train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_val, fs_hr, fs_lr, target_channels, input_channels, multiplier=multiplier, ablation_type=ablation_type)
+    
         del models, models_nn
+        torch.cuda.empty_cache()
+        gc.collect()
+
         if quick_load:
             return results
-        else:
-            return results, dataloader_train, dataloader_test
+        return results, dataloader_train, dataloader_val
     
     print(f"\n=== Sequential HPO for {sr_type} ===")
     
     # Stage 1: mamba_version
     configs = [{"name": f"{sr_nam}_mamba{v}", "use_mamba": True, "use_diffusion": False, "n_mamba_layers": 1, "n_mamba_blocks": 1, "mamba_dim": 64, "mamba_d_state": 16, "mamba_version": v}
                for v in mamba_versions]
-    results, dataloader_train, dataloader_test = run_search(configs, ablation_type="mamba_version", fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, dataloader_train=None, dataloader_test=None)
+    results, dataloader_train, dataloader_val = run_search(configs, ablation_type="mamba_version", fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, dataloader_train=None, dataloader_val=None)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mamba_version_results_fold{fold+1}_{dataset_name}.csv'))
     best_version, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_version")
@@ -242,7 +306,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     # Stage 2: mamba_dim
     configs = [{"name": f"{sr_nam}_mamba{best_version}_d{d}", "use_mamba": True, "use_diffusion": False, "n_mamba_layers": 1, "n_mamba_blocks": 1, "mamba_dim": d, "mamba_d_state": 16, "mamba_version": best_version}
             for d in mamba_dims]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_dim", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_dim", dataloader_train=dataloader_train, dataloader_val=dataloader_val    )
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambadim_fold{fold+1}_{dataset_name}.csv'))
     best_dim, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_dim")
@@ -251,7 +315,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     # Stage 3: mamba_d_state
     configs = [{"name": f"{sr_nam}_mamba{best_version}_d{best_dim}_ds{ds}", "use_mamba": True, "use_diffusion": False, "n_mamba_layers": 1, "n_mamba_blocks": 1, "mamba_dim": best_dim, "mamba_d_state": ds, "mamba_version": best_version}
                 for ds in mamba_d_state]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels,  ablation_type="mamba_d_state", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels,  ablation_type="mamba_d_state", dataloader_train=dataloader_train, dataloader_val=dataloader_val)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambadstate_fold{fold+1}_{dataset_name}.csv'))
     best_d_state, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="mamba_d_state")
@@ -262,7 +326,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
                     "n_mamba_layers": 1, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version,
                     "n_mamba_blocks": nb}
                 for nb in n_mamba_blocks]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_blocks", dataloader_train=dataloader_train, dataloader_test=dataloader_test)      
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_blocks", dataloader_train=dataloader_train, dataloader_val=dataloader_val)      
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambanblocks_fold{fold+1}_{dataset_name}.csv'))
     best_namba_blocks, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="n_mamba_blocks")
@@ -272,7 +336,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
     configs = [{"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{nl}", 
                     "use_mamba": True, "use_diffusion": False, "n_mamba_layers": nl, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version}
                 for nl in n_mamba_layers]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_layers", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_n_layers", dataloader_train=dataloader_train, dataloader_val=dataloader_val)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambanlayers_fold{fold+1}_{dataset_name}.csv'))
     best_n_mamba_layers, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="n_mamba_layers")
@@ -285,7 +349,7 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
         {"name": f"{sr_nam}_no_mamba", "use_mamba": False, "use_diffusion": False, 
         "n_mamba_layers": 0, "n_mamba_blocks": 0, "mamba_dim": 0, "mamba_d_state": 0, "mamba_version": 0}
     ]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_presence", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="mamba_presence", dataloader_train=dataloader_train, dataloader_val=dataloader_val)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_mambapresence_fold{fold+1}_{dataset_name}.csv'))
     best_mamba_presence, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_mamba")
@@ -306,34 +370,16 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
             {"name": f"{sr_nam}_no_mamba_with_diffusion", "use_mamba": False, "use_diffusion": True,
             "n_mamba_layers": 0, "n_mamba_blocks": 0, "mamba_dim": 0, "mamba_d_state": 0, "mamba_version": 0}
         ]
-    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="diffusion_presence", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
+    results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="diffusion_presence", dataloader_train=dataloader_train, dataloader_val=dataloader_val)
     df = pd.DataFrame(results).T
     df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_diffusionpresence_fold{fold+1}_{dataset_name}.csv'))
     best_diff_presence, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_diffusion")
     print(f"✓ Best diffusion presence: {best_diff_presence}")
-        
-    results_diff_no_electrode = best_results.copy()  # Save no electrode embedding results for later
-
-    # Stage 8: Electrode Position Embedding conditioning
-    if best_diff_presence:  # Mamba was used
-        configs = [
-            {"name": f"{sr_nam}_mamba{best_version}_nb{best_namba_blocks}_d{best_dim}_ds{best_d_state}_nl{best_n_mamba_layers}_with_posenc", "use_mamba": best_mamba_presence, "use_diffusion": True,
-            "n_mamba_layers": best_n_mamba_layers, "n_mamba_blocks": best_namba_blocks, "mamba_dim": best_dim, "mamba_d_state": best_d_state, "mamba_version": best_version, "use_electrode_embedding": True},
-        ]
-        results = run_search(configs, fs_hr=fs_hr, fs_lr=fs_lr, target_channels=target_channels, input_channels=input_channels, ablation_type="electrode_position_embedding", dataloader_train=dataloader_train, dataloader_test=dataloader_test)
-        results["no_electrode_position_embedding"] = results_diff_no_electrode  # Add back the no electrode embedding results
-        df = pd.DataFrame(results).T
-        df.to_csv(os.path.join(ablations_path, f'ablation_{sr_type}_electrode_position_embedding_fold{fold+1}_{dataset_name}.csv'))
-        best_electrode_embedding, best_config, best_results = select_best_model(results, configs, metric_key=metric_key, selected_name="use_electrode_embedding")
-        print(f"✓ Best electrode position embedding: {best_electrode_embedding}")
-    else:
-        best_electrode_embedding = False  # No electrode embedding if no diffusion
-        best_config["use_electrode_embedding"] = best_electrode_embedding
     
     if best_version == 0:   
-        print(f"\n🎯 FINAL BEST: No Mamba used, diffusion_presence={best_diff_presence}, use_electrode_embedding: {best_electrode_embedding}")
+        print(f"\n🎯 FINAL BEST: No Mamba used, diffusion_presence={best_diff_presence}")
     else:
-        print(f"\n🎯 FINAL BEST: version={best_version}, dim={best_dim}, d_state={best_d_state}, n_blocks={best_namba_blocks}, n_layers={best_n_mamba_layers}, diffusion_presence={best_diff_presence}, use_electrode_embedding={best_electrode_embedding}")
+        print(f"\n🎯 FINAL BEST: version={best_version}, dim={best_dim}, d_state={best_d_state}, n_blocks={best_namba_blocks}, n_layers={best_n_mamba_layers}, diffusion_presence={best_diff_presence}")
     print(f"   Best metric ({metric_key}): {best_results[metric_key]}")
     
     return {
@@ -342,13 +388,13 @@ def sequential_mamba_hpo(dataset_name, sr_type, fold, train_patients, test_patie
         "all_results": results
     }
 
-def train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, fold=0, multiplier = 8, plot_one_example=True, ablation_type="Final"):
+def train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_val, fs_hr, fs_lr, target_channels, input_channels, fold=0, multiplier = 8, plot_one_example=True, ablation_type="Final"):
 
     results = {}
     results_raw = {}
 
     if multiplier is None:
-        multipliers = [2, 4, 8]
+        multipliers = [8, 4, 2]
     else:
         multipliers = [multiplier]
 
@@ -358,47 +404,44 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
 
         print(f" - Multiplier: {multiplier}, SR Type: {sr_type}")
         dataloader_train.dataset.multiplier = multiplier
-        dataloader_test.dataset.multiplier = multiplier
+        dataloader_val.dataset.multiplier = multiplier
         dataloader_train.dataset.sr_type = sr_type
-        dataloader_test.dataset.sr_type = sr_type
+        dataloader_val.dataset.sr_type = sr_type
         dataloader_train.dataset.fs_lr = fs_lr
-        dataloader_test.dataset.fs_lr = fs_lr
+        dataloader_val.dataset.fs_lr = fs_lr
         dataloader_train.dataset.num_channels = input_channels
-        dataloader_test.dataset.num_channels = input_channels
+        dataloader_val.dataset.num_channels = input_channels
     
         for name, model in models.items():
 
-            print(f"\nTraining {name}...")
-
-            model = model.to(device)
-            summary = torchinfo.summary(model.model)
-            with open(os.path.join(models_path, f'ablations', f'{name}_{dataset_name}_model_summary.txt'), 'w') as f:
-                f.write(str(summary))
-                #early_stopping_callback = EarlyStopping(monitor='avg_val_loss', patience=20, verbose=False, mode='min')
-
-            trainer = Trainer(max_epochs=epochs, accelerator='auto', devices=1 if torch.cuda.is_available() else None, logger=False, enable_checkpointing=False)#, callbacks=[early_stopping_callback])
-            trainer.fit(model, dataloader_train, val_dataloaders=dataloader_test)
-                
-            print(f"Evaluating {name}...")
-            model_nn = model.model.to(device)
-            if model_nn.use_diffusion:
-                num_train_timesteps = model.scheduler.num_train_timesteps
-                inference_timesteps = num_train_timesteps
-                #if num_train_timesteps <= 100:
-                #    inference_timesteps = num_train_timesteps 
-                #else:
-                #    inference_timesteps = num_train_timesteps // 10
+            model_path = os.path.join(models_path, f'ablations', f'DiBiMa_eeg_{name}_{dataset_name}_{fold+1}.pth')
+            if os.path.exists(model_path) and validate_only:
+                print(f"\nLoading pre-trained model for {name} from {model_path}...")
+                model.model.load_state_dict(torch.load(model_path, map_location=device))
+                model.model = model.model.to(device)
             else:
-                inference_timesteps = None
+                if validate_only:
+                    print(f"\nPre-trained model for {name} not found at {model_path}. Skipping evaluation.")
 
-            results[name], results_raw[name] = evaluate_model(model, dataloader_test, n_timesteps=inference_timesteps, evaluate_mean=True)
-            model_path = os.path.join(models_path, f'ablations', f'DiBiMa_eeg_{name}_{fold+1}.pth')
-            torch.save(model.model.state_dict(), model_path)
-            print(f"Model saved to {model_path}")
+               
+                print(f"\nTraining {name}...")
+                model = model.to(device)
+                summary = torchinfo.summary(model.model)
+                with open(os.path.join(models_path, f'ablations', f'{name}_{dataset_name}_model_summary.txt'), 'w') as f:
+                    f.write(str(summary))
+                    #early_stopping_callback = EarlyStopping(monitor='avg_val_loss', patience=20, verbose=False, mode='min')
 
-    # Plot boxplots for raw results       
-    print("\nPlotting metric boxplots...")
-    plot_metric_boxplots(results_raw, name = f'ablation_{ablation_type}_{sr_type}_fold{fold+1}_{dataset_name}', project_path=imgs_path)
+                trainer = Trainer(max_epochs=epochs, accelerator='auto', devices=1 if torch.cuda.is_available() else None, logger=False, enable_checkpointing=False)#, callbacks=[early_stopping_callback])
+                trainer.fit(model, dataloader_train, val_dataloaders=dataloader_val)
+                torch.save(model.model.state_dict(), model_path)
+                print(f"Model saved to {model_path}")
+            
+            print(f"Evaluating {name}...")
+            results[name], results_raw[name] = evaluate_model(model, dataloader_val, sample_type="noise", evaluate_mean=False)
+
+    # Plot barplots for raw results       
+    print("\nPlotting metric...")
+    plot_metric_barplots(results_raw, name = f'ablation_{ablation_type}_{sr_type}_fold{fold+1}_{dataset_name}', project_path=imgs_path)
 
     # Create DataFrame
     df = pd.DataFrame(results).T  # Transpose to have models as rows
@@ -410,11 +453,12 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
     if plot_one_example:
 
         print("\nInference timeseries...")
-        data = next(iter(dataloader_test))
-        input, target, pos, _ = data
+        data = next(iter(dataloader_val))
+        input, target, pos, label = data
         input = input.to(device)
         target = target.to(device)
         pos = pos.to(device)
+        label = label.to(device)
 
         timeseries = {}
         timeseries["GT"] = target.squeeze(0).cpu().detach().numpy()
@@ -425,7 +469,7 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
             timeseries["LR Interpolated"] = interpolated_input.squeeze(0).cpu().detach().numpy()
             channel_to_plot = None # Plot first channel
         else:
-            unmask_chs = unmask_channels[input_channels]
+            unmask_chs = unmask_channels[dataset_name][f'x{multiplier}']
             channel_to_plot = None
             for ch in range(target_channels):
                 if ch not in unmask_chs:
@@ -433,7 +477,7 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
                     break
             if channel_to_plot is None:
                 channel_to_plot = 0
-            lr_up = add_zero_channels(input, target_channels).to(device)
+            lr_up = add_zero_channels(input, target_channels=target_channels, dataset_name=dataset_name, multiplier=multiplier).to(device)
             timeseries["LR Input"] = lr_up.squeeze(0).cpu().detach().numpy()
 
         for name, model in models.items():
@@ -441,20 +485,10 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
             model.eval()
             with torch.no_grad():
                 if model.model.use_diffusion:
-                    #pred_sr = model.sample(input, pos, num_inference_steps=100)
-                    batch_size = input.size(0)
-                    # Sample timesteps as in training
-                    t = torch.randint(
-                        0,
-                        num_train_timesteps,
-                        (batch_size,),
-                        device=device,
-                        dtype=torch.long
-                    )
-                    # Diffuse HR
-                    x_t_hr = torch.randn_like(target).to(device)
-                    # Model prediction (same signature as training)
-                    pred_sr = model(x_t_hr, t, input, pos=None)
+                    if model.model.use_lr_conditioning:
+                        pred_sr = model.sample(input, pos=pos, label=label)
+                    else:
+                        pred_sr = model.sample(input, pos=pos, label=label)
                 else:
                     pred_sr = model.model(input)
             timeseries[name] = pred_sr.squeeze(0).detach().cpu().numpy()
@@ -462,8 +496,6 @@ def train_validate_models(dataset_name, models, sr_type, dataloader_train, datal
         print("Creating plots...")
         save_path = os.path.join(imgs_path, f'{sr_type}_{ablation_type}_example_{dataset_name}.png')
         plot_mean_timeseries(timeseries, save_path=save_path)
-        #save_path_html = os.path.join(imgs_path, f'{sr_type}_{ablation_type}_example_{dataset_name}.html')  
-        #plot_mean_timeseries_plotly(timeseries, channel_to_plot=channel_to_plot, save_path=save_path_html)
 
     return df, results
 
@@ -530,7 +562,7 @@ def set_seed(seed):
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
 
-def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channels, multiplier, nfolds=1):
+def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channels, multiplier, seconds=2, nfolds=1, n_patients=109):
 
     os.makedirs(models_path, exist_ok=True)
     os.makedirs(data_path, exist_ok=True)
@@ -546,10 +578,11 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
         # Create train-test split
         patients = list(range(1, n_patients + 1))
         test_size = 0.2
-        train_patients, test_patients = train_test_split(patients, test_size=test_size, random_state=seed)
+        val_size = 0.1
+        train_patients, val_patients, test_patients = train_test_val_split_patients(patients, test_size=test_size, val_size=val_size, random_state=seed)
         data_folder = data_path + os.sep + dataset_name
 
-        dataloader_test = None  # Initialize dataloader_test
+        dataloader_val = None  # Initialize dataloader_val
         dataloader_train = None  # Initialize dataloader_train
 
         print("\n=== Training and Evaluating Models ===")
@@ -566,40 +599,81 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                     "best_results": {}
                 }
                 models_nn = {}
-                name = f"x{multiplier}_temporal" if sr_type == "temporal" else f"{input_channels}to64chs_spatial"
+                name = f"x{multiplier}_temporal" if sr_type == "temporal" else f"{input_channels}to{target_channels}chs_spatial"
                 models_nn[name] = DiBiMa_nn(
                     target_channels=64 if dataset_name=="mmi" else 62,
                     num_channels=target_channels if sr_type == "temporal" else input_channels,
                     fs_lr=fs_lr if sr_type == "temporal" else fs_hr,
                     fs_hr=fs_hr,
                     seconds=seconds,
-                    residual_global=False,
-                    residual_internal=True,
+                    residual_global=True,
+                    residual_internal=best_params["internal_residual"],
                     use_subpixel=True,
                     sr_type=sr_type,
                     use_mamba=best_params["use_mamba"],
                     use_diffusion=best_params["use_diffusion"],
                     n_mamba_layers=best_params["n_mamba_layers"],
-                    mamba_dim=best_params["dim"],
-                    mamba_d_state=best_params["d_state"],
-                    mamba_version=best_params["version"],
+                    mamba_dim=best_params["mamba_dim"],
+                    mamba_d_state=best_params["mamba_d_state"],
+                    mamba_version=best_params["mamba_version"],
                     n_mamba_blocks=best_params["n_mamba_blocks"],
                     use_positional_encoding=False,
                     use_electrode_embedding=best_params["use_electrode_embedding"],  
-                    merge_type=best_params['merge_type']
+                    merge_type=best_params['merge_type'],
+                    use_label=best_params["use_label"],
+                    use_lr_conditioning=best_params["use_lr_conditioning"],
+                    dataset_name=dataset_name,
+                    multiplier=multiplier
                 )
-                if dataloader_train is None or dataloader_test is None:
-                    models, dataloader_train, dataloader_test = prepare_dataloaders(
-                        dataset_name, models_nn, train_patients, test_patients,
-                        data_folder, quick_load=False, ref_position=None
+                if dataloader_train is None and dataloader_val is None:
+                    if split_windows_first:
+                        dataset = EEGDataset(subject_ids=train_patients + val_patients + test_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=target_channels, seconds=seconds)
+                        dataloader_train, dataloader_val = prepare_dataloaders_windows(
+                            dataset_name, dataset, batch_size=batch_size
+                        )
+                        del dataset
+                    else:
+                        dataloader_train, dataloader_val = prepare_dataloaders_patients(
+                            dataset_name, train_patients, val_patients,
+                            data_folder, seconds=seconds, quick_load=quick_load, ref_position=None
                     )
-                    ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
-                else:
-                    models = prepare_dataloaders(
-                        dataset_name, models_nn, train_patients, test_patients,
-                        data_folder, quick_load=True, ref_position=ref_position
-                    )
-                _, results = train_validate_models(dataset_name, models, sr_type, dataloader_train, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, multiplier=multiplier, ablation_type="Final", plot_one_example=False)
+                    
+                models = {}
+                for name, model in models_nn.items():
+                    if model.use_diffusion:
+                        models[name] = DiBiMa_Diff(model,
+                                                    train_scheduler=train_scheduler,
+                                                    val_scheduler=val_scheduler,
+                                                    criterion=loss_fn,
+                                                    learning_rate=learning_rate,
+                                                    debug=debug,
+                                                    predict_type=prediction_type,
+                                                    epochs=epochs,
+                                                    plot=False).to(device)
+                    else:
+                        models[name] = DiBiMa(model,
+                                                loss_fn=loss_fn,
+                                                learning_rate=learning_rate,
+                                                epochs=epochs,
+                                                debug=debug,
+                                                plot=False).to(device)
+                
+                df, results = train_validate_models(
+                    dataset_name,
+                    models=models,
+                    sr_type=sr_type,
+                    dataloader_train=dataloader_train,
+                    dataloader_val=dataloader_val,
+                    fs_hr=fs_hr,
+                    fs_lr=fs_lr,
+                    target_channels=target_channels,
+                    input_channels=input_channels,
+                    fold=fold,
+                    multiplier=multiplier,
+                    plot_one_example=True,
+                    ablation_type="BestParams"
+                )
+                best_hpo["best_results"] = results[name]
                 results_final[sr_type][fold+1] = results
             else:
                 clear_memory()
@@ -614,6 +688,7 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                     seconds=seconds,
                     train_patients=train_patients,
                     test_patients=test_patients,
+                    val_patients=val_patients,
                     data_folder=data_folder,
                     metric_key="PCC",
                     mamba_versions=mamba_versions,
@@ -625,14 +700,23 @@ def run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channe
                 # Access best params:
                 print(f"Best: {best_hpo['best_config']}")
                 results_final[sr_type][fold+1] = {best_hpo['best_config']['name']: best_hpo["best_results"]}  # or aggregate as needed
+            torch.cuda.empty_cache()
+            gc.collect()
             #break  # Remove this break to run all sr_types
-    
+        del dataloader_train, dataloader_val
+        torch.cuda.empty_cache()
+        gc.collect()
     print(results_final)
     print("\n\n=================== Final Validation Across Folds ===================")
     final_validation(dataset_name, results_final, nfolds=nfolds, ablations_path=ablations_path)
 
 def main():
-    dataset_names = ["seed"] # ["mmi", "seed"]
+
+    #clear_directory(ablations_path)
+    #clear_directory(imgs_path)
+    #clear_directory(os.path.join(models_path, 'ablations'))
+    
+    dataset_names = ["mmi"]#["mmi", "seed"]
     multiplier = 8
     for dataset_name in dataset_names:
         print(f"\n\n########## Running Ablation Study for Dataset: {dataset_name} ##########")
@@ -642,19 +726,14 @@ def main():
         else:
             fs_hr = 200
             target_channels = 62
-        input_channels = math.ceil(target_channels / multiplier)  #for spatial sr #62/8=7.75 -> 8
+        input_channels = len(unmask_channels[dataset_name][f"x{multiplier}"])
         fs_lr = fs_hr // multiplier
-        run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channels, multiplier, nfolds=nfolds)
-        break
+        n_patients = dict_n_patients[dataset_name]
+        seconds = 2
+        run_ablation_study(dataset_name, fs_hr, fs_lr, target_channels, input_channels, multiplier, seconds=seconds, nfolds=nfolds, n_patients=n_patients)
+        #break  # Remove this break to run all datasets
 
 if __name__ == '__main__':
-
     sys.exit(main())
 
-#add tomography (location of electrodes) to guide-condition diffusion process: Done
-#add SEED dataset: Done, testing now
-
 #Downstream task: brain state classification (sleep stages, cognitive load, autism detection), more exploratory with explainability,
-
-
-#Working on metrics.py line 180-193: using sample or forward? sample is to slow

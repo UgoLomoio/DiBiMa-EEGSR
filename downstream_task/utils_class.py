@@ -139,7 +139,7 @@ class EEGDatasetClassification(Dataset):
                     data = hr_data.clone()
                 else:
                     data = hr_data.copy() # numpy array
-                data = get_lr_data_spatial(data, num_channels=self.num_channels)
+                data = get_lr_data_spatial(data, dataset_name=self.dataset_name, sr_ratio=self.multiplier)  # (C', T) or (C', W)
             data = torch.tensor(data, dtype=torch.float32)
 
         elif self.input_type == "sr":

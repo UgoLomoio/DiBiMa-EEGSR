@@ -4,17 +4,14 @@ from models import *
 from utils import *
 import os 
 from metrics import *
-from sklearn.model_selection import train_test_split
-from torch.utils.data import DataLoader
 import pandas as pd
 from tabulate import tabulate
 import mne
-from visualize import plot_mean_timeseries
-from utils import unmask_channels
 import gc 
 from torch.cuda import empty_cache
 import sys
-from utils import set_seed
+from utils import set_seed, plot_mean_timeseries, unmask_channels, add_zero_channels
+from train import * 
 
 gc.collect()
 empty_cache()
@@ -22,32 +19,27 @@ mne.set_log_level('ERROR')
 
 project_path = os.getcwd()
 
+sr_types = ["spatial"] #["temporal", "spatial"]
+nfolds = 4
+
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-# Hyperparameters
-batch_size = 32
-seeds = 2
-epochs = 1
-learning_rate = 1e-3
-seconds = 10 #2 #9760 samples /160 Hz = 61 seconds
-nfolds = 4 # Number of folds for cross-validation
 
 torch.set_float32_matmul_precision('high')  # For better performance on GPUs with Tensor Cores
 
 demo = False # Set to True for a quick demo run
 debug = False  # Set to True to enable debug mode with additional logging
+skip_umap = True  # Set to True to skip UMAP plotting for faster execution
 
 if demo:
     print("Demo mode activated: Using smaller dataset and fewer epochs for quick testing.")
     quick_load = False
-    nfolds = 1
+    nfolds = 2
 
 dict_n_patients = {
     "mmi": 109,
     "seed": 15
-}
-n_patients = dict_n_patients["mmi"]  # Number of patients in the dataset   
+} 
 
 models_path = project_path + os.sep + "model_weights"
 data_path = project_path + os.sep + "eeg_data"
@@ -56,94 +48,41 @@ imgs_path = project_path + os.sep + "imgs"
 if not os.path.exists(imgs_path):
     os.makedirs(imgs_path)
 
-loss_fn = nn.MSELoss() #nn.MSELoss() #ReconstructionLoss()  # Loss function: callable function
-
-sr_types = ["spatial", "temporal"]  # Types of super-resolution to evaluate
-
-n_timesteps = 1000  # Number of diffusion timesteps
-
-best_params = {
-    "version": 2,
-    "dim": 64, #64,  
-    "d_state": 8, #16,  
-    "n_mamba_blocks": 2, #5
-    "n_mamba_layers": 2, #1
-    "use_mamba": True,
-    "use_diffusion": True,
-    "use_electrode_embedding": True,
-    'merge_type': 'add'  # 'concat' or 'add'
-}
-
-prediction_type = "sample"  # "epsilon", "sample" or "v_prediction"
-diffusion_params = {
-                    "num_train_timesteps": n_timesteps, #100,
-                    "beta_start": 1e-4,     #1e-5
-                    "beta_end": 1e-2,        #1e-2                                                                               
-                    "beta_schedule": "squaredcos_cap_v2",  #"linear" or "squaredcos_cap_v2"
-                    "prediction_type": prediction_type,
-                    #"clip_sample": True,
-                    #"clip_sample_range": 1,
-}
-
 def load_model_weights(model, model_path):
 
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device))
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
         print(f"Model weights loaded from {model_path}")
     else:
         raise Exception(f"Model weights file not found at {model_path}.")
     return model
 
-def prepare_dataloaders(dataset_name, models_nn, train_patients, test_patients, data_folder, fold=0, quick_load=True, ref_position=None):
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+def prepare_models(models_nn, ref_position, dataset_name, fold=0):
 
     models = {}
-
-    num_channels = 64 if dataset_name == "mmi" else 62
-
-    if not quick_load:    
-        
-        #print("Downloading training data...")
-        #dataset_train = EEGDataset(subject_ids=train_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
-        print("Downloading testing data...")
-        dataset_test = EEGDataset(subject_ids=test_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=num_channels)
-
-        #if len(dataset_train) == 0:
-        #    print("No data loaded. Check dataset creation process.")
-        #    exit(1)
-            
-        #dataloader_train = DataLoader(dataset_train, batch_size=batch_size, shuffle=True)
-        dataloader_test = DataLoader(dataset_test, batch_size=batch_size, shuffle=False)
-        print("Train and Test datasets loaded successfully.")    
-
-        #ref_position = dataloader_train.dataset.ref_position.to(device)  # Reference electrode positions
-    
-    for name, model in models_nn.items():
-        
+    for model_name, model in models_nn.items():
         model.ref_position = ref_position  # Set reference positions in the model
-
+        print(f"Preparing model: {model_name}, Diffusion: {model.use_diffusion}")
+        name_clean = model_name.replace(f"_diff{int(model.use_diffusion)}", "")
         if model.use_diffusion == False:
+            print(f"Loading non-diffusion model: {model_name}")
+            name = f"BiMa_eeg_{name_clean}_{dataset_name}_{fold+1}"
             models[name] = DiBiMa(model, learning_rate=learning_rate, loss_fn=loss_fn, debug=debug).to(device)
-            models[name] = load_model_weights(models[name], os.path.join(models_path, f'fold_{fold+1}', f'DiBiMa_eeg_{name}_{fold+1}.pth'))
         else:
+            name = f"DiBiMa_eeg_{name_clean}_{dataset_name}_{fold+1}"
             models[name] = DiBiMa_Diff(model,
-                                        loss_fn,
-                                        diffusion_params=diffusion_params,
-                                        learning_rate=learning_rate,
-                                        scheduler_params=None,
-                                        predict_type=prediction_type,  # "epsilon" or "sample"
-                                        debug=debug,
-                                        epochs=epochs,
-                                        plot=False).to(device)
-            
-            models[name].model = load_model_weights(models[name].model, os.path.join(models_path, f'fold_{fold+1}', f'DiBiMa_eeg_{name}_{fold+1}.pth'))
-
-    if quick_load:
-        return models 
-    else:       
-        return models, dataloader_test
-    
+                                       train_scheduler=train_scheduler,
+                                       val_scheduler=val_scheduler,
+                                       criterion=loss_fn,
+                                       learning_rate=learning_rate,
+                                       predict_type=prediction_type,  # "epsilon" or "sample"
+                                       debug=debug,
+                                       epochs=epochs,
+                                       plot=False).to(device)
+        path = os.path.join(models_path, f'fold_{fold+1}', f'{name}.pth')
+        print(f"Loading model weights from: {path}")
+        models[name].model = load_model_weights(models[name].model, path)
+    return models     
 
 def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, fold=0, multiplier = None, plot_one_example=True, ablation_type="Final"):
 
@@ -167,33 +106,30 @@ def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr
 
         for name, model in models.items():
 
-            print(f"\nTraining {name}...")
-
+            print(f"\nTesting {name}...")
             model = model.to(device)
-            model_nn = model.model.to(device)
-            if model_nn.use_diffusion:
-                num_train_timesteps = model.scheduler.num_train_timesteps
-                inference_timesteps = num_train_timesteps
+            model.eval()
+            if model.model.use_diffusion:
+                if model.model.use_lr_conditioning:
+                    results[name], results_raw[name] = evaluate_model(model, dataloader_test, flatten=True, sample_type="lr_conditioned", evaluate_mean=False)
+                else:
+                    results[name], results_raw[name] = evaluate_model(model, dataloader_test, flatten=True, sample_type="noise", evaluate_mean=False)
             else:
-                inference_timesteps = None
-
-            results[name], results_raw[name] = evaluate_model(model, dataloader_test, n_timesteps=inference_timesteps, evaluate_mean=True)
-            model_path = os.path.join(models_path, f'fold_{fold+1}', f'DiBiMa_eeg_{name}_{fold+1}.pth')
-            torch.save(model.model.state_dict(), model_path)
-            print(f"Model saved to {model_path}")
-
-    # Plot boxplots for raw results       
-    print("\nPlotting metric boxplots...")
-    plot_metric_boxplots(results_raw, name = f'ablation_{ablation_type}_{sr_type}_fold{fold+1}_{dataset_name}', project_path=imgs_path)
+                results[name], results_raw[name] = evaluate_model(model, dataloader_test, flatten=True, sample_type=None, evaluate_mean=False)
+         
+    # Plot barplots for raw results       
+    print("\nPlotting metric barplots...")
+    plot_metric_barplots(results_raw, name = f'ablation_{ablation_type}_{sr_type}_fold{fold+1}_{dataset_name}', project_path=imgs_path)
 
     if plot_one_example:
 
         print("\nInference timeseries...")
         data = next(iter(dataloader_test))
-        input, target, pos, _ = data
+        input, target, pos, label = data
         input = input.to(device)
         target = target.to(device)
         pos = pos.to(device)
+        label = label.to(device)
 
         timeseries = {}
         timeseries["GT"] = target.squeeze(0).cpu().detach().numpy()
@@ -204,7 +140,7 @@ def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr
             timeseries["LR Interpolated"] = interpolated_input.squeeze(0).cpu().detach().numpy()
             channel_to_plot = None # Plot first channel
         else:
-            unmask_chs = unmask_channels[input_channels]
+            unmask_chs = unmask_channels[dataset_name][f'x{multiplier}']
             channel_to_plot = None
             for ch in range(target_channels):
                 if ch not in unmask_chs:
@@ -212,7 +148,7 @@ def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr
                     break
             if channel_to_plot is None:
                 channel_to_plot = 0
-            lr_up = add_zero_channels(input, target_channels).to(device)
+            lr_up = add_zero_channels(input, target_channels, dataset_name=dataset_name, multiplier=multiplier).to(device)
             timeseries["LR Input"] = lr_up.squeeze(0).cpu().detach().numpy()
 
         for name, model in models.items():
@@ -220,20 +156,10 @@ def validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr
             model.eval()
             with torch.no_grad():
                 if model.model.use_diffusion:
-                    #pred_sr = model.sample(input, pos, num_inference_steps=100)
-                    batch_size = input.size(0)
-                    # Sample timesteps as in training
-                    t = torch.randint(
-                        0,
-                        num_train_timesteps,
-                        (batch_size,),
-                        device=device,
-                        dtype=torch.long
-                    )
-                    # Diffuse HR
-                    x_t_hr = torch.randn_like(target).to(device)
-                    # Model prediction (same signature as training)
-                    pred_sr = model(x_t_hr, t, input, pos=None)
+                    if model.model.use_lr_conditioning:
+                        pred_sr = model.sample_from_lr(input, pos=pos, label=label)
+                    else:
+                        pred_sr = model.sample(input, pos=pos, label=label)
                 else:
                     pred_sr = model.model(input)
             timeseries[name] = pred_sr.squeeze(0).detach().cpu().numpy()
@@ -263,12 +189,18 @@ def final_validation(dataset_name, results_final):
         values_dict = {}
         for fold, results_param_fold in results_final_sr.items():
             for model_name, metric_dict in results_param_fold.items():
+                print(f"Fold {fold}, Model: {model_name}, Metrics: {metric_dict}")
                 if model_name not in values_dict:
                     values_dict[model_name] = {}
                 for metric_name, metric_value in metric_dict.items():
+                    if metric_name in ["Parameters"]:
+                        continue
                     metric_value = split_result(metric_value)
-                    if metric_value is not None:
-                        values_dict[model_name][metric_name] = metric_value
+                    if metric_name not in values_dict[model_name]:
+                        #print(f" - Metric: {metric_name}, Value: {metric_value}")
+                        values_dict[model_name][metric_name] = [metric_value]
+                    else:
+                        values_dict[model_name][metric_name].append(metric_value)
 
         #print(values_dict)
 
@@ -277,11 +209,12 @@ def final_validation(dataset_name, results_final):
         for model_name, dict1 in values_dict.items():
             dict_final = {}
             dict_final['Model'] = model_name
-            #print(f"\nFinal results for model: {model_name}")
+            print(f"\nFinal results for model: {model_name}")
             for metric, values in dict1.items():       
-                #print(f" - Metric: {metric}, Values across folds: {values}")
+                print(f" - Metric: {metric}, Values across folds: {values}")
                 overall_mean = np.mean(values)
                 overall_std = np.std(values)
+                print(f" - Metric: {metric}, Overall Mean: {overall_mean}, Overall Std: {overall_std}")
                 dict_final[metric] = f"{overall_mean:.6f}±{overall_std:.4f}"
             to_df.append(dict_final)
 
@@ -298,7 +231,8 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
     os.makedirs(data_path, exist_ok=True)
 
     results_final = {"temporal": {}, "spatial": {}}
-
+    n_patients = dict_n_patients[dataset_name]  # Number of patients in the dataset  
+    
     for fold in range(nfolds):
         
         gc.collect()
@@ -309,73 +243,105 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
         # Create train-test split
         patients = list(range(1, n_patients + 1))
         test_size = 0.2
-        train_patients, test_patients = train_test_split(patients, test_size=test_size, random_state=seed)
+        train_patients, val_patients, test_patients = train_test_val_split_patients(patients, test_size=test_size, random_state=seed)
         data_folder = data_path + os.sep + dataset_name
 
-        dataloader_test = None  # Initialize dataloader_test
-        #dataloader_train = None  # Initialize dataloader_train
+        # Prepare dataloaders
+        if split_windows_first:
+            dataset = EEGDataset(subject_ids=train_patients+val_patients+test_patients, data_folder=data_folder, dataset_name=dataset_name, verbose=False, demo=demo, num_channels=target_channels, seconds=seconds)
+            dataloader_train, _, dataloader_test = prepare_dataloaders_windows(
+                        dataset_name, dataset, seconds=seconds, batch_size=batch_size, return_test=True
+            )
+            del dataset
+        else:
+            dataloader_train, dataloader_test = prepare_dataloaders_windows(
+                        dataset_name, dataset, seconds=seconds, batch_size=batch_size, return_test=True
+            )
 
+        #torch.save(dataloader_test.dataset, os.path.join("eeg_data", 'dataset_test.pth'))
+        #break
         print("\n=== Training and Evaluating Models ===")
         for sr_type in sr_types:
+            dataloader_test.dataset.sr_type = sr_type
+        
             print(f"\n--- SR Type: {sr_type} ---")
-            results_final[sr_type] = {}
-
             for multiplier in multipliers:
+                dataloader_test.dataset.multiplier = multiplier
+                dataloader_test.dataset.fs_lr = fs_hr // multiplier if sr_type == "temporal" else fs_hr
+                dataloader_test.dataset.num_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{multiplier}"])
+                
                 print(f"\n### Fold {fold+1}, Multiplier: {multiplier} ###")
-                input_channels = target_channels if sr_type == "temporal" else math.ceil(target_channels / multiplier)
+                input_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{multiplier}"])
                 fs_hr = fs_hr
                 fs_lr = fs_hr // multiplier if sr_type == "temporal" else fs_hr
-                
-                # In your main loop, for each sr_type:
-                if best_params is not None:
-                    print(f"Using predefined best params: {best_params}")
-                    models_nn = {}
-                    name = f"x{multiplier}_temporal" if sr_type == "temporal" else f"{input_channels}to64chs_spatial"
-                    models_nn[name] = DiBiMa_nn(
-                        target_channels=target_channels,
-                        num_channels=input_channels,
-                        fs_lr=fs_lr,
-                        fs_hr=fs_hr,
-                        seconds=seconds,
-                        residual_global=False,
-                        residual_internal=True,
-                        use_subpixel=True,
-                        sr_type=sr_type,
-                        use_mamba=best_params["use_mamba"],
-                        use_diffusion=best_params["use_diffusion"],
-                        n_mamba_layers=best_params["n_mamba_layers"],
-                        mamba_dim=best_params["dim"],
-                        mamba_d_state=best_params["d_state"],
-                        mamba_version=best_params["version"],
-                        n_mamba_blocks=best_params["n_mamba_blocks"],
-                        use_positional_encoding=False,
-                        use_electrode_embedding=best_params["use_electrode_embedding"],  
-                        merge_type=best_params['merge_type']
-                    )
-                    if dataloader_test is None:
-                        models, dataloader_test = prepare_dataloaders(
-                            dataset_name, models_nn, train_patients, test_patients,
-                            data_folder, quick_load=False, ref_position=None
-                        )
-                        ref_position = dataloader_test.dataset.ref_position.to(device)  # Reference electrode positions
-                    else:
-                        models = prepare_dataloaders(
-                            dataset_name, models_nn, train_patients, test_patients,
-                            data_folder, quick_load=True, ref_position=ref_position
-                        )
-                    results = validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, fold=fold, multiplier=multiplier, ablation_type="Final")
-                    if fold+1 not in results_final[sr_type]:
-                        results_final[sr_type][fold+1] = {name : results[name]}
-                    else:
-                        results_final[sr_type][fold+1][name] = results[name]
+                base_params = base_params_temporal if sr_type == "temporal" else base_params_spatial
+                best_params = base_params.copy()
 
+                models_nn = {}
+                for diffusion in [False, True]:
+                    best_params["use_diffusion"] = diffusion
+                    
+                    for param_name in base_params_cond.keys():
+                        if diffusion:
+                            best_params[param_name] = base_params_cond[param_name]
+                        else:
+                            best_params[param_name] = False 
+    
+                    print(f"Using predefined best params: {best_params}")
+                    name = f"x{multiplier}_temporal_diff{int(diffusion)}" if sr_type == "temporal" else f"{input_channels}to{target_channels}chs_spatial_diff{int(diffusion)}"
+                    models_nn[name] = DiBiMa_nn(
+                            target_channels=target_channels,
+                            num_channels=input_channels,
+                            fs_lr=fs_lr,
+                            fs_hr=fs_hr,
+                            seconds=seconds,
+                            residual_global=True,
+                            residual_internal=best_params["internal_residual"],
+                            use_subpixel=True,
+                            sr_type=sr_type,
+                            use_mamba=best_params["use_mamba"],
+                            use_diffusion=best_params["use_diffusion"],
+                            n_mamba_layers=best_params["n_mamba_layers"],
+                            mamba_dim=best_params["mamba_dim"],
+                            mamba_d_state=best_params["mamba_d_state"],
+                            mamba_version=best_params["mamba_version"],
+                            n_mamba_blocks=best_params["n_mamba_blocks"],
+                            use_positional_encoding=False,
+                            use_electrode_embedding=best_params["use_electrode_embedding"],  
+                            merge_type=best_params['merge_type'],
+                            use_label=best_params['use_label'],
+                            use_lr_conditioning=best_params['use_lr_conditioning'],
+                            dataset_name=dataset_name,
+                            multiplier=multiplier
+                    )
+                    
+                models = prepare_models(models_nn, ref_position=None, dataset_name=dataset_name, fold=fold)
+                results = validate_models(dataset_name, models, sr_type, dataloader_test, fs_hr, fs_lr, target_channels, input_channels, fold=fold, multiplier=multiplier, ablation_type="Final")
+                for model_name, metric_dict in results.items():
+                    model_name_clean = model_name[:-2]#exclude fold number from name
+                    if fold+1 not in results_final[sr_type]:
+                        results_final[sr_type][fold+1] = {model_name_clean: metric_dict}
+                    else: 
+                        results_final[sr_type][fold+1][model_name_clean] = results[model_name]
+
+                if not skip_umap:
                     for name, model in models.items():
                         with torch.no_grad():
                             model.eval()
                             # UMAP of latent space
+                            dataloader_train.dataset.multiplier = multiplier
+                            dataloader_train.dataset.sr_type = sr_type
+                            dataloader_train.dataset.fs_lr = fs_lr if sr_type == "temporal" else fs_hr
+                            dataloader_train.dataset.num_channels = target_channels if sr_type == "temporal" else input_channels
+                            dataloader_test.dataset.multiplier = multiplier
+                            dataloader_test.dataset.sr_type = sr_type
+                            dataloader_test.dataset.fs_lr = fs_lr if sr_type == "temporal" else fs_hr
+                            dataloader_test.dataset.num_channels = target_channels if sr_type == "temporal" else input_channels
+
                             filepath = os.path.join(imgs_path,f'umap_{name}_fold{fold+1}.png')
                             plot_umap_latent_space( 
                                                     model, 
+                                                    dataloader_train,
                                                     dataloader_test,
                                                     save_path=filepath
                             )
@@ -388,7 +354,7 @@ def run(dataset_name, fs_hr=160, target_channels=64, multipliers=[2,4,8], nfolds
 def main():
      
     set_seed(seed)
-    dataset_names = ["mmi", "seed"]
+    dataset_names = ["seed"]#, "mmi"]#, "seed"]
     multipliers = [2, 4, 8]  # SR multipliers
     for dataset_name in dataset_names:
         print(f"\n\n########## Running Ablation Study for Dataset: {dataset_name} ##########")
@@ -399,7 +365,7 @@ def main():
             fs_hr = 200
             target_channels = 62
         run(dataset_name, fs_hr=fs_hr, target_channels=target_channels, multipliers=multipliers, nfolds=nfolds)
-        break
+        #break
 
 if __name__ == '__main__':
 

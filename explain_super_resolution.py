@@ -7,12 +7,11 @@ import torch
 import matplotlib.pyplot as plt
 import warnings
 import numpy as np
-from captum.attr import LayerGradCam
 import torch.nn.functional as F
 
 warnings.filterwarnings('ignore')
 
-from test import best_params, loss_fn, learning_rate, debug, epochs, diffusion_params, prediction_type, load_model_weights
+from test import *
 from models import DiBiMa_Diff, DiBiMa_nn
 
 cwd = os.getcwd()
@@ -37,9 +36,6 @@ data_folder = DATA_DIR
 
 import torch
 import torch.nn.functional as F
-
-import torch
-import torch.nn.functional as F
 import numpy as np
 
 class DiBiMaGradCam:
@@ -48,32 +44,39 @@ class DiBiMaGradCam:
     def __init__(self, diffusion_model, device='cuda'):
         self.device = device
         self.model = diffusion_model.model.to(device).train()
-        self.model.use_diffusion = True
-        self.num_timesteps = diffusion_model.scheduler.num_train_timesteps
-        self.scheduler = diffusion_model.scheduler
-        
+        if self.model.use_diffusion:
+            self.use_diffusion = True
+            self.num_timesteps = diffusion_model.train_scheduler.num_train_timesteps
+            self.scheduler = diffusion_model.train_scheduler
+        else:
+            self.use_diffusion = False
+
         decoder_modules = list(self.model.decoder_sr)
         self.target_layer = decoder_modules[-2]  # Conv1d
         print(f"✅ Target Conv1d: {type(self.target_layer).__name__}")
     
-    def generate_heatmap(self, lr, hr, pos):
+    def generate_heatmap(self, lr, hr, pos, label=None):
         self.model.zero_grad()
         
         if lr.ndim == 2: lr = lr.unsqueeze(0)
         if hr.ndim == 2: hr = hr.unsqueeze(0)
         if pos.ndim == 2: pos = pos.unsqueeze(0)
-        
-        b = lr.size(0)
-        t = torch.full((b,), self.num_timesteps - 1, dtype=torch.long, device=self.device)
-        lr_d = lr.to(self.device)
-        hr_d = hr.to(self.device)
-        pos_d = pos.to(self.device)
-        noise = torch.randn_like(hr_d)
-        x_t = self.scheduler.add_noise(hr_d, noise, t)
-        
-        x_t.requires_grad_(True)
-        pred = self.model(x_t, t, lr_d, pos_d)
-        loss = F.mse_loss(pred, noise)
+
+        if self.use_diffusion:
+            b = lr.size(0)
+            t = torch.full((b,), self.num_timesteps - 1, dtype=torch.long, device=self.device)
+            lr_d = lr.to(self.device)
+            hr_d = hr.to(self.device)
+            pos_d = pos.to(self.device)
+            noise = torch.randn_like(hr_d)
+            x_t = noise
+            x_t.requires_grad_(True)
+            pred = self.model(x_t, t, lr=lr_d, pos=pos_d, label=label)
+        else:
+            lr_d = lr.to(self.device)
+            x_t = lr_d.clone().detach().requires_grad_(True)
+            pred = self.model(x_t)
+        loss = F.mse_loss(pred, hr.to(self.device))
         print(f"Loss: {loss.item():.4f}")
         
         # SIMPLIFIED: Input gradients (works always)
@@ -114,6 +117,7 @@ class DiBiMaGradCam:
             heatmap = zoom(heatmap, len(signal)/len(heatmap), order=1)
         
         time = np.arange(len(signal)) / fs
+        print(f"Signal length: {len(signal)}, Heatmap length: {len(heatmap)}, Time range: {time[-1]:.2f}s")
         signal_min, signal_max = signal.min(), signal.max()
         
         fig, (ax1, ax2) = plt.subplots(2, 1, figsize=figsize, sharex=True,
@@ -161,29 +165,35 @@ class DiBiMaGradCam:
 if __name__ == "__main__":
 
     dataset_name = 'mmi'
-    fs_hr = 160
-    target_channels = 64
-    sr_types = ['spatial', 'temporal']
+    sr_types = ['spatial'] #, 'temporal']
     
     # Data
     num_subjects = dict_n_patients[dataset_name]
     all_ids = list(range(1, num_subjects + 1)) 
     train_ids, test_ids = train_test_split(all_ids, test_size=0.2, random_state=seed)
     dataset_path = os.path.join(data_folder, dataset_name)
-                  
-    dataset_test = EEGDataset(test_ids, dataset_path, dataset_name=dataset_name, demo=demo) 
+
+    seconds = 2       
+    dataset_test = EEGDataset(test_ids, dataset_path, dataset_name=dataset_name, demo=demo, seconds=seconds) 
     val_loader = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
            
-    seconds = 10
-    target_channels = 64
+    target_channels = 64 if dataset_name == 'mmi' else 62
+    fs_hr = 160 if dataset_name == 'mmi' else 200
+    multiplier = 8  # for spatial SR
     results = {}
+
     for sr_type in sr_types:
         
+        best_params = base_params_spatial if sr_type == "spatial" else base_params_temporal
+        for key, value in base_params_cond.items():
+            best_params[key] = False
+        best_params["use_diffusion"] = False  
+
         print(f"Explaining super-resolution for type: {sr_type}")
-        in_channels = 64 if sr_type == "temporal" else 8
+        in_channels = 64 if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{multiplier}"])
         fs_lr = 20 if sr_type == "temporal" else 160
-        str_param = "x8" if sr_type == "temporal" else f"8to64chs"
-        model_path = f'model_weights/fold_1/DiBiMa_eeg_{str_param}_{sr_type}_1.pth'
+        str_param = f"x{multiplier}" if sr_type == "temporal" else f"{in_channels}to{target_channels}chs"
+        model_path = f'model_weights/BiMa_eeg_{str_param}_{sr_type}_{dataset_name}.pth'
         print(f"Loading model from: {model_path}")
         model = DiBiMa_nn(
                                     target_channels=target_channels,
@@ -191,57 +201,57 @@ if __name__ == "__main__":
                                     fs_lr=fs_lr,
                                     fs_hr=fs_hr,
                                     seconds=seconds,
-                                    residual_global=False,
-                                    residual_internal=True,
+                                    residual_global=True,
+                                    residual_internal=best_params["internal_residual"],
                                     use_subpixel=True,
                                     sr_type=sr_type,
                                     use_mamba=best_params["use_mamba"],
                                     use_diffusion=best_params["use_diffusion"],
                                     n_mamba_layers=best_params["n_mamba_layers"],
-                                    mamba_dim=best_params["dim"],
-                                    mamba_d_state=best_params["d_state"],
-                                    mamba_version=best_params["version"],
+                                    mamba_dim=best_params["mamba_dim"],
+                                    mamba_d_state=best_params["mamba_d_state"],
+                                    mamba_version=best_params["mamba_version"],
                                     n_mamba_blocks=best_params["n_mamba_blocks"],
                                     use_positional_encoding=False,
                                     merge_type=best_params["merge_type"],
                                     use_electrode_embedding=best_params["use_electrode_embedding"],  
+                                    use_label=best_params["use_label"],
+                                    use_lr_conditioning=best_params["use_lr_conditioning"],
+                                    dataset_name=dataset_name,
+                                    multiplier=multiplier
         )
+        """
         model_pl = DiBiMa_Diff(model,
-                                            loss_fn,
-                                            diffusion_params=diffusion_params,
+                                            criterion=loss_fn,
+                                            train_scheduler=train_scheduler,
+                                            val_scheduler=val_scheduler,
                                             learning_rate=learning_rate,
-                                            scheduler_params=None,
                                             predict_type=prediction_type,  # "epsilon" or "sample"
                                             debug=debug,
                                             epochs=epochs,
                                             plot=False
         ).to(device)
         model_pl.model = load_model_weights(model_pl.model, model_path).to(device)
-
+        """
+        model = load_model_weights(model, model_path).to(device)
+        model_pl = DiBiMa(model, dataset_name=dataset_name, multiplier=multiplier).to(device)
+        
         # Set sr_type for dataset
         val_loader.dataset.sr_type = sr_type
-        val_loader.dataset.multiplier = 8
-        val_loader.dataset.sr_type = sr_type
+        val_loader.dataset.multiplier = multiplier
         val_loader.dataset.fs_lr = fs_lr
         val_loader.dataset.num_channels = in_channels
         channel_names = val_loader.dataset.channel_names
-
-        # Get a batch of test data
-        eeg_lr, eeg_hr, pos, label = next(iter(val_loader))
-        eeg_lr = eeg_lr.to(device)
-        eeg_hr = eeg_hr.to(device)
-        print(f"Low-res EEG shape: {eeg_lr.shape}, High-res EEG shape: {eeg_hr.shape}")
         
         # Explainer 
         explainer = DiBiMaGradCam(model_pl)
+
         # Single explanation
-        lr, hr, pos, label = next(iter(val_loader))  # get first batch
-        lr = lr[0].squeeze()  # (C, L)
-        hr = hr[0].squeeze()
-        pos = pos[0]
-        label = label[0].item()
-        heatmap, _ = explainer.generate_heatmap(lr, hr, pos)
+        lr, hr, pos, label = val_loader.dataset[0]  # single sample
+
+        heatmap, _ = explainer.generate_heatmap(lr, hr, pos, label=label)
         #Plot explanation
         fig = explainer.plot_explanation(lr, heatmap, label, fs=fs_lr)
         fig.savefig(f'gradcam_{dataset_name}_{sr_type}_single.png')
         plt.close(fig)
+        print(f"Saved explanation figure for {sr_type} SR.")

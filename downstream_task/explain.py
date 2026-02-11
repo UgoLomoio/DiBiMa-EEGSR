@@ -17,8 +17,9 @@ parent_dir = os.path.join(current_dir, os.pardir)  # or os.path.dirname(current_
 parent_abs = os.path.abspath(parent_dir)
 print(f"Adding to sys.path: {parent_abs}")
 sys.path.insert(0, parent_abs)
-from test import best_params, loss_fn, learning_rate, debug, epochs, diffusion_params, prediction_type
-from models import DiBiMa_Diff, DiBiMa_nn
+from test import base_params_cond, base_params_spatial, base_params_temporal, loss_fn, learning_rate, debug, epochs, diffusion_params, prediction_type
+from models import DiBiMa, DiBiMa_Diff, DiBiMa_nn
+from utils import unmask_channels
 
 cwd = os.getcwd()
 
@@ -32,7 +33,7 @@ BATCH_SIZE = 32
 NUM_WORKERS = 1    # Adjust based on your system
 MULTIPLIER = 8
 LR = 1e-4
-MAX_EPOCHS = 50
+MAX_EPOCHS = 30
 
 demo = True # we only need one for explanation
 seed = 2
@@ -40,7 +41,8 @@ dict_n_patients = {
     "mmi": 109,
     "seed": 15
 }
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 data_folder = DATA_DIR
 
 if demo:
@@ -184,45 +186,52 @@ def main():
         dataset_test = EEGDatasetClassification(test_ids, dataset_path, dataset_name=dataset_name, model_sr=model_sr, demo=demo) 
         val_loader = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
                
-        seconds = 10
+        seconds = 2 
         results = {}
 
-        for sr_type in ["temporal", "spatial"]:
+        for sr_type in ["spatial"]:
             results[sr_type] = {}
             for input_type in ["hr", "lr", "sr"]:
                 results[sr_type][input_type] = {}
                 if input_type == "lr":
-                    in_channels = target_channels if sr_type == "temporal" else int(target_channels//MULTIPLIER)
+                    in_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{MULTIPLIER}"])
                     fs_lr = int(fs_hr//MULTIPLIER) if sr_type == "temporal" else fs_hr
                 elif input_type == "hr":
                     in_channels = target_channels
                 else:
                     #Model
-                    in_channels = target_channels if sr_type == "temporal" else int(target_channels//MULTIPLIER)
+                    in_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{MULTIPLIER}"])
                     fs_lr = int(fs_hr//MULTIPLIER) if sr_type == "temporal" else fs_hr
                     str_param = "x8" if sr_type == "temporal" else f"{in_channels}to{target_channels}chs"
-                    model_path = f'{parent_abs}/model_weights/fold_1/DiBiMa_eeg_{str_param}_{sr_type}_1.pth'
+                    model_path = f'{parent_abs}/model_weights/fold_1/BiMa_eeg_{str_param}_{sr_type}_1.pth'
+                    best_params = base_params_temporal if sr_type == "temporal" else base_params_spatial
+                    for key in base_params_cond:
+                        best_params[key] = False
+                    best_params["use_diffusion"] = False  # No diffusion for explanation
+
                     model = DiBiMa_nn(
                                     target_channels=target_channels,
                                     num_channels=in_channels,
                                     fs_lr=fs_lr,
                                     fs_hr=fs_hr,
                                     seconds=seconds,
-                                    residual_global=False,
-                                    residual_internal=True,
+                                    residual_global=True,
+                                    residual_internal=best_params["internal_residual"],
                                     use_subpixel=True,
                                     sr_type=sr_type,
                                     use_mamba=best_params["use_mamba"],
                                     use_diffusion=best_params["use_diffusion"],
                                     n_mamba_layers=best_params["n_mamba_layers"],
-                                    mamba_dim=best_params["dim"],
-                                    mamba_d_state=best_params["d_state"],
-                                    mamba_version=best_params["version"],
+                                    mamba_dim=best_params["mamba_dim"],
+                                    mamba_d_state=best_params["mamba_d_state"],
+                                    mamba_version=best_params["mamba_version"],
                                     n_mamba_blocks=best_params["n_mamba_blocks"],
                                     use_positional_encoding=False,
                                     merge_type=best_params["merge_type"],
                                     use_electrode_embedding=best_params["use_electrode_embedding"],  
+                                    use_lr_conditioning=best_params["use_lr_conditioning"]
                     )
+                    """
                     model_pl = DiBiMa_Diff(model,
                                             loss_fn,
                                             diffusion_params=diffusion_params,
@@ -233,7 +242,10 @@ def main():
                                             epochs=epochs,
                                             plot=False
                     ).to(device)
-                    model_sr = load_model_weights(model_pl, model_path).to(device)
+                    """
+                    print(in_channels, target_channels)
+                    model = load_model_weights(model, model_path)
+                    model_sr = DiBiMa(model, dataset_name=dataset_name, multiplier=MULTIPLIER).to(device)
                     val_loader.dataset.model_sr = model_sr
 
                 val_loader.dataset.input_type = input_type
@@ -241,7 +253,6 @@ def main():
                 val_loader.dataset.num_channels = in_channels
  
                 NUM_CLASSES = dataset_test.labels.unique().shape[0] #+ 1
-                
 
                 model = ResNet50(in_channels=in_channels, classes=NUM_CLASSES).to(device)
                 optimizer = torch.optim.Adam(model.parameters(), lr=LR)
@@ -250,7 +261,11 @@ def main():
                 lit_model = ResNetPL(model, optimizer, criterion)
 
                 # Load best model
-                lit_model.load_state_dict(torch.load(os.path.join('model_weights', f'best_model_{dataset_name}_{input_type}_{sr_type}.pth')))
+                if input_type == "hr":
+                    model_name = f'best_model_{dataset_name}_hr.pth'
+                else:
+                    model_name = f'best_model_{dataset_name}_{input_type}_{sr_type}.pth'
+                lit_model.load_state_dict(torch.load(os.path.join('model_weights', model_name), map_location=device))
                 lit_model.eval() 
 
                 # Explainer 

@@ -16,12 +16,11 @@ from torch.nn.functional import l1_loss
 def next_power_of_2(n):
     return 2 ** int(np.ceil(np.log2(n)))
 
-
-def load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type):
+def load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type, dataset_name='mmi', multiplier=8):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    str_param = f'{int(in_channels)}to{int(target_channels)}chs' if sr_type == 'spatial' else f'x{int(fs_hr/fs_lr)}'
-    model_path = f'./model_weights/fold_1/DiBiMa_eeg_{str_param}_{sr_type}_1.pth'
+    str_param = f'{int(in_channels)}to{int(target_channels)}chs_{dataset_name}' if sr_type == 'spatial' else f'x{int(fs_hr/fs_lr)}_{dataset_name}'
+    model_path = f'./model_weights/DiBiMa_eeg_{str_param}_{sr_type}_1.pth'
     print(f"Loading model from {model_path}...")
     model = DiBiMa_nn(
         target_channels=target_channels,
@@ -29,31 +28,34 @@ def load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type):
         fs_lr=fs_lr,
         fs_hr=fs_hr,
         seconds=seconds,
-        residual_global=False,
-        residual_internal=True,
+        residual_global=True,
+        residual_internal=best_params["internal_residual"],
         use_subpixel=True,
         sr_type=sr_type,
         use_mamba=best_params["use_mamba"],
         use_diffusion=best_params["use_diffusion"],
         n_mamba_layers=best_params["n_mamba_layers"],
-        mamba_dim=best_params["dim"],
-        mamba_d_state=best_params["d_state"],
-        mamba_version=best_params["version"],
+        mamba_dim=best_params["mamba_dim"],
+        mamba_d_state=best_params["mamba_d_state"],
+        mamba_version=best_params["mamba_version"],
         n_mamba_blocks=best_params["n_mamba_blocks"],
         use_positional_encoding=False,
         use_electrode_embedding=best_params["use_electrode_embedding"],  
-        merge_type=best_params['merge_type']
+        use_label=best_params["use_label"],
+        use_lr_conditioning=best_params["use_lr_conditioning"],
+        merge_type=best_params['merge_type'],
+        dataset_name=dataset_name,
+        multiplier=multiplier
     ).to(device)
     model_pl = DiBiMa_Diff(model,
-        loss_fn,
-        diffusion_params=diffusion_params,
-        learning_rate=learning_rate,
-        scheduler_params=None,
-        predict_type=prediction_type,  # "epsilon" or "sample"
-        debug=debug,
-        epochs=epochs,
-        plot=False
-    ).to(device)
+                            train_scheduler=train_scheduler,
+                            val_scheduler=val_scheduler,
+                            criterion=loss_fn,
+                            learning_rate=learning_rate,
+                            debug=debug,
+                            predict_type=prediction_type,
+                            epochs=epochs,
+                            plot=False).to(device)
     model_pl.model = load_model_weights(model, model_path).to(device)
     model_pl.eval()
     return model_pl
@@ -74,14 +76,14 @@ def compute_topomap_psd(signals, fs_hr, sr_type, target_channel_names, dataset_n
         fs = fs_hr
         if sr_type == 'spatial':
             if "LR" in label:
-                input_channels = signals[label].shape[0]
-                channel_names = list(target_channel_names[unmask_channels[input_channels]])
+                scale = label.split('_')[-1][2:]  # e.g., '8' from 'LR_/8'
+                channel_names = list(target_channel_names[unmask_channels[dataset_name][f"x{scale}"]])
             else:
                 channel_names = list(target_channel_names)
         else:  # temporal
             channel_names = list(target_channel_names)
 
-        raw = set_montage(signals[label], dataset_name, sr_type, label, pos, channel_names, fs)
+        raw = set_montage(signals[label], dataset_name, pos, channel_names, fs)
         raw_dict[label] = raw  # Store raw for later use
         psd_dict[label] = {}
         for j, (band_name, (fmin, fmax)) in enumerate(bands.items()):
@@ -107,11 +109,12 @@ def compute_topomap_psd(signals, fs_hr, sr_type, target_channel_names, dataset_n
 def plot_topomap(models, dataloader, index, fs_hr, sr_type, target_channel_names, dataset_name):
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    _, hr, pos, _ = list(iter(dataloader))[index]
+    lr, hr, pos, label = list(iter(dataloader))[index]
     with torch.no_grad():
 
         hr = hr[0].to(device)
         pos = pos[0].to(device)
+        label = label[0].to(device)
 
         if sr_type == 'spatial':
             lr_8 = get_lr_data_spatial(hr, num_channels=math.ceil(hr.shape[0]/8)).to(device)
@@ -124,9 +127,9 @@ def plot_topomap(models, dataloader, index, fs_hr, sr_type, target_channel_names
 
         print(f"Generating SR signals for topomap plotting...")
         print(f"HR shape: {hr.shape}, LR_/8 shape: {lr_8.shape}, LR_/4 shape: {lr_4.shape}, LR_/2 shape: {lr_2.shape}")
-        sr_8 = models['x8'].predict(hr.unsqueeze(0), lr_8.unsqueeze(0), pos.unsqueeze(0))[0]
-        sr_4 = models['x4'].predict(hr.unsqueeze(0), lr_4.unsqueeze(0), pos.unsqueeze(0))[0]
-        sr_2 = models['x2'].predict(hr.unsqueeze(0), lr_2.unsqueeze(0), pos.unsqueeze(0))[0]
+        sr_8 = models['x8'].sample_from_lr(lr_8.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+        sr_4 = models['x4'].sample_from_lr(lr_4.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+        sr_2 = models['x2'].sample_from_lr(lr_2.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
         
         if sr_type == 'temporal':
             lr_8 = signal.resample(lr_8.cpu().detach().numpy(), lr_8.shape[-1] * 8, axis=-1)
@@ -227,20 +230,22 @@ def main():
             for model_path in models_path.values():
                 fs_lr = fs_hr // int(model_path.split('_')[-3][1:])
                 name = model_path.split('_')[-3]  # e.g., 'x8'
-                models[sr_type][name] = load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type)
+                multiplier = int(name[1:])
+                models[sr_type][name] = load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type, dataset_name=dataset_name, multiplier = multiplier)
 
             with torch.no_grad():
-                for _, hr, pos, _ in iter(dataloader_test):
+                for _, hr, pos, label in iter(dataloader_test):
                     hr = hr.to(device)
                     pos = pos.to(device)
+                    label = label.to(device)
                     
                     lr_8 = torch.tensor(get_lr_data_temporal(hr.cpu().detach().numpy(), factor=8)).to(device)
                     lr_4 = torch.tensor(get_lr_data_temporal(hr.cpu().detach().numpy(), factor=4)).to(device)
                     lr_2 = torch.tensor(get_lr_data_temporal(hr.cpu().detach().numpy(), factor=2)).to(device)
 
-                    sr_8 = models[sr_type]['x8'].predict(hr, lr_8, pos)
-                    sr_4 = models[sr_type]['x4'].predict(hr, lr_4, pos)
-                    sr_2 = models[sr_type]['x2'].predict(hr, lr_2, pos)
+                    sr_8 = models[sr_type]['x8'].sample_from_lr(lr_8.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+                    sr_4 = models[sr_type]['x4'].sample_from_lr(lr_4.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+                    sr_2 = models[sr_type]['x2'].sample_from_lr(lr_2.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
                     
                     lr_8 = signal.resample(lr_8.cpu().detach().numpy(), lr_8.shape[-1] * 8, axis=-1)
                     lr_4 = signal.resample(lr_4.cpu().detach().numpy(), lr_4.shape[-1] * 4, axis=-1)
@@ -255,15 +260,16 @@ def main():
         else:
             target_channels = 64 if dataset_name == 'mmi' else 62
             models_path = {
-                'x8': f'./model_weights/fold_1/DiBiMa_eeg_{math.ceil(target_channels/8)}to{target_channels}chs_spatial_1.pth',
-                'x4': f'./model_weights/fold_1/DiBiMa_eeg_{math.ceil(target_channels/4)}to{target_channels}chs_spatial_1.pth',
-                'x2': f'./model_weights/fold_1/DiBiMa_eeg_{math.ceil(target_channels/2)}to{target_channels}chs_spatial_1.pth'
+                'x8': f'./model_weights/fold_1/DiBiMa_eeg_{len(unmask_channels[dataset_name]["x8"])}to{target_channels}chs_{dataset_name}_spatial_1.pth',
+                'x4': f'./model_weights/fold_1/DiBiMa_eeg_{len(unmask_channels[dataset_name]["x4"])}to{target_channels}chs_{dataset_name}_spatial_1.pth',
+                'x2': f'./model_weights/fold_1/DiBiMa_eeg_{len(unmask_channels[dataset_name]["x2"])}to{target_channels}chs_{dataset_name}_spatial_1.pth'
             }
             fs_lr = fs_hr = 160 if dataset_name == 'mmi' else 200
             for model_path in models_path.values():
                 in_channels = int(model_path.split('_')[4].split('to')[0])  # e.g., '8' from '8to64chs'
                 target_channels = num_channels
-                model = load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type)
+                multiplier = int(name[1:])
+                model = load_model(in_channels, target_channels, fs_lr, fs_hr, seconds, sr_type, dataset_name=dataset_name, multiplier = multiplier)
                 name = "x" + str(math.ceil(num_channels / in_channels))
                 models[sr_type][name] = model
             
@@ -272,12 +278,12 @@ def main():
                     hr = hr.to(device)
                     pos = pos.to(device)
                     
-                    lr_8 = get_lr_data_spatial(hr, num_channels=math.ceil(target_channels/8)).to(device)
-                    lr_4 = get_lr_data_spatial(hr, num_channels=math.ceil(target_channels/4)).to(device)
-                    lr_2 = get_lr_data_spatial(hr, num_channels=math.ceil(target_channels/2)).to(device)
-                    sr_8 = models[sr_type]['x8'].predict(hr, lr_8, pos)
-                    sr_4 = models[sr_type]['x4'].predict(hr, lr_4, pos)
-                    sr_2 = models[sr_type]['x2'].predict(hr, lr_2, pos)
+                    lr_8 = get_lr_data_spatial(hr, num_channels=len(unmask_channels[dataset_name]["x8"])).to(device)
+                    lr_4 = get_lr_data_spatial(hr, num_channels=len(unmask_channels[dataset_name]["x4"])).to(device)
+                    lr_2 = get_lr_data_spatial(hr, num_channels=len(unmask_channels[dataset_name]["x2"])).to(device)
+                    sr_8 = models[sr_type]['x8'].sample_from_lr(lr_8.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+                    sr_4 = models[sr_type]['x4'].sample_from_lr(lr_4.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
+                    sr_2 = models[sr_type]['x2'].sample_from_lr(lr_2.unsqueeze(0), pos.unsqueeze(0), label.unsqueeze(0))[0]
                     hr_signals[sr_type].append(hr.cpu())
                     sr_signals[sr_type]['x8'].append(sr_8.cpu())
                     sr_signals[sr_type]['x4'].append(sr_4.cpu())
@@ -327,6 +333,7 @@ def main():
             print(f"  Scale {scale}:")
             for band_name, mae in maes[sr_type][scale].items():
                 print(f"    {band_name}: {mae:.4f} dB/Hz")
+
     df = pd.DataFrame.from_dict({(i,j): maes[i][j] 
                            for i in maes.keys()
                            for j in maes[i].keys()}, orient='index')

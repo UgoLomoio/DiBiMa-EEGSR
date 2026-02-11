@@ -1,3 +1,4 @@
+import math
 import os
 import sys
 from sklearn.model_selection import train_test_split
@@ -16,7 +17,7 @@ parent_dir = os.path.join(current_dir, os.pardir)  # or os.path.dirname(current_
 parent_abs = os.path.abspath(parent_dir)
 print(f"Adding to sys.path: {parent_abs}")
 sys.path.insert(0, parent_abs)
-from test import best_params, loss_fn, learning_rate, debug, epochs, diffusion_params, prediction_type
+from test import *
 from models import DiBiMa_Diff, DiBiMa_nn
 
 cwd = os.getcwd()
@@ -109,51 +110,59 @@ def main():
         dataset_test = EEGDatasetClassification(test_ids, dataset_path, dataset_name=dataset_name, model_sr=model_sr, demo=demo) 
         val_loader = DataLoader(dataset_test, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
                
-        seconds = 10
+        seconds = 2
         results = {}
 
-        for sr_type in ["temporal", "spatial"]:
+        for i, sr_type in enumerate(["spatial"]):
             dict_for_auc = {}
             results[sr_type] = {}
             for input_type in ["hr", "lr", "sr"]:
+                if input_type == "hr" and i >= 1:
+                    print(f"Skipping {input_type} {sr_type} since HR spatial data is not available.")
+                    continue
                 results[sr_type][input_type] = {}
                 if input_type == "lr":
-                    in_channels = target_channels if sr_type == "temporal" else int(target_channels//MULTIPLIER)
+                    in_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{MULTIPLIER}"])
                     fs_lr = int(fs_hr//MULTIPLIER) if sr_type == "temporal" else fs_hr
                 elif input_type == "hr":
                     in_channels = target_channels
                 else:
                     #Model
-                    in_channels = target_channels if sr_type == "temporal" else int(target_channels//MULTIPLIER)
+                    in_channels = target_channels if sr_type == "temporal" else len(unmask_channels[dataset_name][f"x{MULTIPLIER}"])
                     fs_lr = int(fs_hr//MULTIPLIER) if sr_type == "temporal" else fs_hr
-                    str_param = "x8" if sr_type == "temporal" else f"{in_channels}to{target_channels}chs"
-                    model_path = f'{parent_abs}/model_weights/fold_1/DiBiMa_eeg_{str_param}_{sr_type}_1.pth'
+                    str_param = f"x{MULTIPLIER}" if sr_type == "temporal" else f"{in_channels}to{target_channels}chs"
+                    best_params = base_params_temporal if sr_type == "temporal" else base_params_spatial
+                    for key, value in base_params_cond.items():
+                        best_params[key] = value
+                    model_path = f'{parent_abs}/model_weights/fold_1/DiBiMa_eeg_{str_param}_{sr_type}_{dataset_name}_1.pth'
                     model = DiBiMa_nn(
                                     target_channels=target_channels,
                                     num_channels=in_channels,
                                     fs_lr=fs_lr,
                                     fs_hr=fs_hr,
                                     seconds=seconds,
-                                    residual_global=False,
-                                    residual_internal=True,
+                                    residual_global=True,
+                                    residual_internal=best_params["internal_residual"],
                                     use_subpixel=True,
                                     sr_type=sr_type,
                                     use_mamba=best_params["use_mamba"],
                                     use_diffusion=best_params["use_diffusion"],
                                     n_mamba_layers=best_params["n_mamba_layers"],
-                                    mamba_dim=best_params["dim"],
-                                    mamba_d_state=best_params["d_state"],
-                                    mamba_version=best_params["version"],
+                                    mamba_dim=best_params["mamba_dim"],
+                                    mamba_d_state=best_params["mamba_d_state"],
+                                    mamba_version=best_params["mamba_version"],
                                     n_mamba_blocks=best_params["n_mamba_blocks"],
                                     use_positional_encoding=False,
                                     merge_type=best_params["merge_type"],
+                                    use_label=best_params["use_label"],
+                                    use_lr_conditioning=best_params["use_lr_conditioning"],
                                     use_electrode_embedding=best_params["use_electrode_embedding"],  
                     )
                     model_pl = DiBiMa_Diff(model,
-                                            loss_fn,
-                                            diffusion_params=diffusion_params,
+                                           train_scheduler=train_scheduler,
+                                           val_scheduler=val_scheduler,
+                                            criterion=loss_fn,
                                             learning_rate=learning_rate,
-                                            scheduler_params=None,
                                             predict_type=prediction_type,  # "epsilon" or "sample"
                                             debug=debug,
                                             epochs=epochs,
@@ -165,7 +174,8 @@ def main():
                 val_loader.dataset.input_type = input_type
                 val_loader.dataset.sr_type = sr_type
                 val_loader.dataset.num_channels = in_channels
- 
+                val_loader.dataset.multiplier = MULTIPLIER
+
                 NUM_CLASSES = dataset_test.labels.unique().shape[0] #+ 1
                 print(f"Training ResNet50 on {dataset_name} dataset with {input_type} {sr_type} data: in_channels={in_channels}, num_classes={NUM_CLASSES}")
 
@@ -177,9 +187,13 @@ def main():
                 lit_model = ResNetPL(model, optimizer, criterion)
 
                 # Load best model
-                lit_model.load_state_dict(torch.load(os.path.join('model_weights', f'best_model_{dataset_name}_{input_type}_{sr_type}.pth')))
+                if input_type in ["lr", "sr"]:
+                    model_name = f"best_model_{dataset_name}_{input_type}_{sr_type}.pth"
+                else:
+                    model_name = f"best_model_{dataset_name}_hr.pth"
+                lit_model.load_state_dict(torch.load(os.path.join('model_weights', model_name)))
                 
-                results[sr_type][input_type] = {"name": f"x8_{sr_type}_{input_type}"}
+                results[sr_type][input_type] = {"name": f"x{MULTIPLIER}_{sr_type}_{input_type}"}
                 
                 # Evaluate
                 print(f"Evaluating on test set for {dataset_name} with {input_type} {sr_type} data.")
@@ -188,10 +202,10 @@ def main():
                 y_logits = y_logits.cpu().numpy()
                 y_probs = y_probs.cpu().numpy()
                 y_preds = y_preds.cpu().numpy()
-                dict_for_auc[f"x8_{sr_type}_{input_type}"] = {"y_trues": y_true}
-                dict_for_auc[f"x8_{sr_type}_{input_type}"]["y_preds"] = y_preds
-                dict_for_auc[f"x8_{sr_type}_{input_type}"]["y_probs"] = y_probs
-                dict_for_auc[f"x8_{sr_type}_{input_type}"]["y_logits"] = y_logits
+                dict_for_auc[f"x{MULTIPLIER}_{sr_type}_{input_type}"] = {"y_trues": y_true}
+                dict_for_auc[f"x{MULTIPLIER}_{sr_type}_{input_type}"]["y_preds"] = y_preds
+                dict_for_auc[f"x{MULTIPLIER}_{sr_type}_{input_type}"]["y_probs"] = y_probs
+                dict_for_auc[f"x{MULTIPLIER}_{sr_type}_{input_type}"]["y_logits"] = y_logits
                 print("Computing metrics...")
                 metrics = compute_metrics(y_true, y_preds, y_probs)
                 print(f"Metrics for {dataset_name} with {input_type} {sr_type}: {metrics}")
